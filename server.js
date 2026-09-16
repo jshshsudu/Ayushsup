@@ -15,24 +15,22 @@ if (!APIFY_TOKEN) {
 // ---------------------------------------------------------------------------
 const APIFY_ACTOR = 'apify~cheerio-scraper';
 const APIFY_BASE = 'https://api.apify.com/v2';
-const BATCH_SIZE = 50;                        // URLs per Apify ru
+const BATCH_SIZE = 50;                        // URLs per Apify run
 const BATCH_MEMORY_MB = 2048;                 // 2 GB per run
-const MAX_CONCURRENT_RUNS = 4;                // 4 × 2 GB = 8 GB (within Free plan)
+const MAX_CONCURRENT_RUNS = 4;                // 4 × 2 GB = 8 GB total
 
 const GROUP_SIZE = 200;                       // channels per refresh group
 const GROUP_STAGGER_MS = 5 * 60 * 1000;       // 5 min between initial upload groups
 const GROUP_REFRESH_INTERVAL_S = 5 * 3600;    // refresh each group every 5 hours
-const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;  // 30 min retry if a group refresh fails
+const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;  // 30 min retry on failure
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
 // ---------------------------------------------------------------------------
 //  STORAGE
 // ---------------------------------------------------------------------------
-const channelStore = new Map();   // channelId -> channel object (includes groupId)
-
-// groupId -> { groupId, channelIds:[], lastRefreshAt, nextRefreshAt, timer, processing }
-const groups = new Map();
+const channelStore = new Map();   // channelId -> channel object
+const groups = new Map();         // groupId -> group object
 
 const stats = {
     totalAdded: 0,
@@ -73,6 +71,54 @@ function chunkArray(arr, size) {
     return chunks;
 }
 
+// ---------------------------------------------------------------------------
+//  URL / COOKIE SANITIZATION (fixes double __hdnea__= prefix)
+// ---------------------------------------------------------------------------
+
+/**
+ * Strips any accidental __hdnea__= or hdnea= prefix from a cookie value.
+ *   "hdnea=st=...~hmac=...; Domain=..."     → "st=...~hmac=..."
+ *   "__hdnea__=st=...~hmac=...; Domain=..." → "st=...~hmac=..."
+ *   "st=...~hmac=...; Domain=..."           → "st=...~hmac=..."
+ */
+function cleanCookieValue(cookieStr) {
+    let s = cookieStr.split(';')[0].trim();
+    while (s.startsWith('__hdnea__=')) s = s.substring('__hdnea__='.length);
+    while (s.startsWith('hdnea='))     s = s.substring('hdnea='.length);
+    return s;
+}
+
+/**
+ * Rebuilds a URL with exactly one "__hdnea__=" prefix.
+ */
+function buildUrlWithCookie(baseUrl, cookieValue) {
+    const idx = baseUrl.indexOf('__hdnea__=');
+    let base;
+    if (idx === -1) {
+        base = baseUrl.includes('?') ? baseUrl + '&' : baseUrl + '?';
+    } else {
+        base = baseUrl.substring(0, idx);
+    }
+    return base + '__hdnea__=' + cookieValue;
+}
+
+/**
+ * Sanitizes a URL — guarantees exactly one "__hdnea__=" prefix.
+ */
+function sanitizeUrl(url) {
+    if (!url) return url;
+    const idx = url.indexOf('__hdnea__=');
+    if (idx === -1) return url;
+    const base = url.substring(0, idx + '__hdnea__='.length);
+    let value = url.substring(idx + '__hdnea__='.length);
+    while (value.startsWith('__hdnea__=')) value = value.substring('__hdnea__='.length);
+    while (value.startsWith('hdnea='))     value = value.substring('hdnea='.length);
+    return base + value;
+}
+
+// ---------------------------------------------------------------------------
+//  ACL EXTRACTION
+// ---------------------------------------------------------------------------
 function extractAclFromUrl(url) {
     const m = url.match(/~acl=([^~]+)~/);
     if (m) return m[1].trim();
@@ -88,12 +134,6 @@ function extractAclFromCookie(cookieStr) {
 function normaliseAcl(acl) {
     if (!acl) return '';
     return acl.toLowerCase().replace(/\/+$/, '').replace(/\*+$/, '').trim();
-}
-
-function applyCookieToUrl(originalUrl, pureCookie) {
-    const idx = originalUrl.indexOf('__hdnea__=');
-    if (idx === -1) return originalUrl;
-    return originalUrl.substring(0, idx + '__hdnea__='.length) + pureCookie;
 }
 
 function isSpecialChannel(url) {
@@ -182,7 +222,8 @@ async function runApify(urls) {
 //  BATCH PROCESSOR
 // ---------------------------------------------------------------------------
 async function processBatchOfChannels(channels, label) {
-    const urls = channels.map(c => c.url);
+    // Sanitize every input URL before sending to Apify
+    const urls = channels.map(c => sanitizeUrl(c.url));
     log(`▶️  [${label}] starting ${urls.length} urls`);
 
     for (const ch of channels) {
@@ -194,18 +235,27 @@ async function processBatchOfChannels(channels, label) {
     if (!Array.isArray(results)) throw new Error('Apify returned non-array');
     log(`◀️  [${label}] got ${results.length} results`);
 
+    // Build ACL -> cookie map from Apify results
     const aclToCookie = new Map();
     for (const item of results) {
         const headers = item.headers || {};
         let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
         if (!setCookie) continue;
         const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
+
+        // ✅ Clean the cookie value (strips __hdnea__= or hdnea= prefix)
+        const cookieValue = cleanCookieValue(cookieStr);
+        if (!cookieValue || !cookieValue.startsWith('st=')) continue;
+
         const aclRaw = extractAclFromCookie(cookieStr);
         if (!aclRaw) continue;
         const acl = normaliseAcl(aclRaw);
-        const exp = extractExpiry(cookieStr.split(';')[0]);
+        const exp = extractExpiry(cookieValue);
+
         const existing = aclToCookie.get(acl);
-        if (!existing || exp > existing.exp) aclToCookie.set(acl, { cookieStr, exp });
+        if (!existing || exp > existing.exp) {
+            aclToCookie.set(acl, { cookieValue, exp });
+        }
     }
     log(`   [${label}] ACL map: ${aclToCookie.size} unique`);
 
@@ -214,6 +264,7 @@ async function processBatchOfChannels(channels, label) {
     for (const ch of channels) {
         const aclUrl = normaliseAcl(extractAclFromUrl(ch.url));
         let hit = null;
+
         if (aclUrl) {
             hit = aclToCookie.get(aclUrl);
             if (!hit) {
@@ -232,7 +283,8 @@ async function processBatchOfChannels(channels, label) {
             channelStore.set(ch.channelId, {
                 ...(channelStore.get(ch.channelId) || {}),
                 channelId: ch.channelId, name: ch.name,
-                originalUrl: ch.url, currentUrl: ch.url,
+                originalUrl: ch.url,
+                currentUrl: sanitizeUrl(ch.url),
                 cookie: '', expires: 0,
                 lastUpdated: getFormattedDate(),
                 status: 'no_cookie', error: 'No cookie for ACL',
@@ -242,16 +294,21 @@ async function processBatchOfChannels(channels, label) {
 
         aclToCookie.delete(aclUrl);
 
-        const pureCookie = hit.cookieStr.split(';')[0];
-        const exp = extractExpiry(pureCookie);
-        if (exp <= 0) { failed++; continue; }
+        if (hit.exp <= 0) {
+            failed++;
+            continue;
+        }
 
-        const newUrl = applyCookieToUrl(ch.url, pureCookie);
+        // ✅ Build URL with guaranteed single __hdnea__= prefix
+        const newUrl = buildUrlWithCookie(ch.url, hit.cookieValue);
+
         channelStore.set(ch.channelId, {
             ...(channelStore.get(ch.channelId) || {}),
             channelId: ch.channelId, name: ch.name,
-            originalUrl: ch.url, currentUrl: newUrl,
-            cookie: pureCookie, expires: exp,
+            originalUrl: ch.url,
+            currentUrl: newUrl,
+            cookie: 'hdnea=' + hit.cookieValue,
+            expires: hit.exp,
             lastUpdated: getFormattedDate(),
             status: 'active', error: null,
         });
@@ -319,7 +376,7 @@ async function processGroup(groupId) {
         const inputs = activeChannels.map(c => ({
             channelId: c.channelId,
             name: c.name,
-            url: c.originalUrl,
+            url: sanitizeUrl(c.originalUrl),
         }));
 
         const batches = chunkArray(inputs, BATCH_SIZE);
@@ -348,12 +405,10 @@ async function processGroup(groupId) {
         g.lastRefreshAt = Math.floor(Date.now() / 1000);
         g.processing = false;
 
-        // Schedule next refresh 5h from now
         scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
     } catch (err) {
         log(`❌ [${groupId}] group refresh failed: ${err.message}`, 'error');
         g.processing = false;
-        // Retry sooner
         scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
     }
 }
@@ -362,17 +417,17 @@ async function processGroup(groupId) {
 //  INITIAL PROCESSING — grouped with stagger
 // ---------------------------------------------------------------------------
 async function processAllChannels(channels) {
-    const channelGroups = chunkArray(channels, GROUP_SIZE);
-    log(`🚀 [START] ${channels.length} channels in ${channelGroups.length} groups of ${GROUP_SIZE} (stagger ${GROUP_STAGGER_MS / 60000} min)`);
+    // Sanitize all inputs upfront
+    const cleanChannels = channels.map(ch => ({ ...ch, url: sanitizeUrl(ch.url) }));
+
+    const channelGroups = chunkArray(cleanChannels, GROUP_SIZE);
+    log(`🚀 [START] ${cleanChannels.length} channels in ${channelGroups.length} groups of ${GROUP_SIZE} (stagger ${GROUP_STAGGER_MS / 60000} min)`);
     stats.startedAt = stats.startedAt || getFormattedDate();
 
     for (let i = 0; i < channelGroups.length; i++) {
         const groupChannels = channelGroups[i];
-
-        // Create the group entry
         const groupId = createGroup(groupChannels.map(c => c.channelId));
 
-        // Tag each channel with groupId
         for (const ch of groupChannels) {
             const cur = channelStore.get(ch.channelId) || {};
             channelStore.set(ch.channelId, { ...cur, groupId });
@@ -380,7 +435,6 @@ async function processAllChannels(channels) {
 
         log(`📦 [GROUP ${i + 1}/${channelGroups.length}] ${groupChannels.length} channels → ${groupId}`);
 
-        // Process the group in 50-batches (all through the shared apifyLimit)
         const batches = chunkArray(groupChannels, BATCH_SIZE);
         let idx = 0;
         const tasks = batches.map(batch =>
@@ -394,7 +448,7 @@ async function processAllChannels(channels) {
                         const cur = channelStore.get(ch.channelId) || {};
                         channelStore.set(ch.channelId, {
                             ...cur, channelId: ch.channelId, name: ch.name,
-                            originalUrl: ch.url, currentUrl: cur.currentUrl || ch.url,
+                            originalUrl: ch.url, currentUrl: cur.currentUrl || sanitizeUrl(ch.url),
                             status: 'error', error: err.message,
                         });
                         stats.failed++;
@@ -404,12 +458,10 @@ async function processAllChannels(channels) {
         );
         await Promise.all(tasks);
 
-        // Record completion time and schedule first refresh
         const g = groups.get(groupId);
         g.lastRefreshAt = Math.floor(Date.now() / 1000);
         scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
 
-        // Stagger before the next group
         if (i < channelGroups.length - 1) {
             log(`⏳ Waiting ${GROUP_STAGGER_MS / 60000} min before group ${i + 2}…`);
             await sleep(GROUP_STAGGER_MS);
@@ -434,7 +486,7 @@ function parseChannelInput(text) {
                 const id = String(item.Id ?? item.id ?? item.channelId ?? item.channel_id ?? '').trim();
                 const url = String(item.url ?? item.URL ?? '').trim();
                 if (!id || !url.startsWith('http')) return null;
-                return { channelId: id, name: item.name || id, url };
+                return { channelId: id, name: item.name || id, url: sanitizeUrl(url) };
             }).filter(Boolean);
         }
     } catch (_) {}
@@ -449,9 +501,24 @@ function parseChannelInput(text) {
         if (!url) continue;
         const nonUrl = parts.filter(p => p && !p.startsWith('http'));
         const id = nonUrl[0] || `ch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-        channels.push({ channelId: String(id), name: nonUrl[1] || id, url });
+        channels.push({ channelId: String(id), name: nonUrl[1] || id, url: sanitizeUrl(url) });
     }
     return channels;
+}
+
+// ---------------------------------------------------------------------------
+//  STARTUP SANITIZATION — heals any corrupted entries on boot
+// ---------------------------------------------------------------------------
+function sanitizeStoreOnBoot() {
+    let fixed = 0;
+    for (const [id, c] of channelStore.entries()) {
+        const cleaned = sanitizeUrl(c.currentUrl || c.originalUrl);
+        if (cleaned !== c.currentUrl) {
+            channelStore.set(id, { ...c, currentUrl: cleaned, originalUrl: sanitizeUrl(c.originalUrl) });
+            fixed++;
+        }
+    }
+    if (fixed > 0) log(`🧹 Startup: sanitized ${fixed} corrupted URLs`);
 }
 
 // ---------------------------------------------------------------------------
@@ -530,7 +597,8 @@ gt.innerHTML='';
 for(const g of d.groups){
 const tr=document.createElement('tr');
 const next=g.nextRefreshAt?new Date(g.nextRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
-tr.innerHTML='<td>'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+(g.lastRefreshAt?new Date(g.lastRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—')+'</td><td>'+next+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
+const last=g.lastRefreshAt?new Date(g.lastRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
+tr.innerHTML='<td style="font-size:10px">'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+last+'</td><td>'+next+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
 gt.appendChild(tr);
 }
 
@@ -611,7 +679,6 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
             }
         }
 
-        // Run the staggered group upload in background
         processAllChannels(channels).catch(e => log(`Global crash: ${e.message}`, 'error'));
 
         res.json({ success: true, added: channels.length });
@@ -670,13 +737,16 @@ app.get('/jiostb.json', (req, res) => {
         .filter(c => c.status === 'active')
         .map(c => ({
             channel_id: c.channelId,
-            url: c.currentUrl,
+            url: sanitizeUrl(c.currentUrl),
             name: c.name,
             last_updated: c.lastUpdated,
         }));
     res.json(result);
 });
 
+// ---------------------------------------------------------------------------
+//  DIAGNOSTICS
+// ---------------------------------------------------------------------------
 app.get('/debug/groups', (req, res) => {
     const now = Math.floor(Date.now() / 1000);
     res.json([...groups.values()].map(g => ({
@@ -687,6 +757,16 @@ app.get('/debug/groups', (req, res) => {
         secondsUntilRefresh: g.nextRefreshAt ? g.nextRefreshAt - now : null,
         processing: g.processing,
     })));
+});
+
+app.get('/debug/corrupted', (req, res) => {
+    const bad = [];
+    for (const c of channelStore.values()) {
+        if (c.currentUrl && /__hdnea__=__hdnea__=|__hdnea__=hdnea=/.test(c.currentUrl)) {
+            bad.push({ channelId: c.channelId, currentUrl: c.currentUrl, status: c.status });
+        }
+    }
+    res.json({ count: bad.length, channels: bad });
 });
 
 app.get('/debug/state', (req, res) => {
@@ -705,6 +785,7 @@ app.get('/debug/state', (req, res) => {
 //  START
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
+    sanitizeStoreOnBoot();
     log(`Server started on port ${PORT}`);
     log(`Batch: ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Workers: ${MAX_CONCURRENT_RUNS}`);
     log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
