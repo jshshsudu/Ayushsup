@@ -15,7 +15,7 @@ if (!APIFY_TOKEN) {
 // ---------------------------------------------------------------------------
 const APIFY_ACTOR = 'apify~cheerio-scraper';
 const APIFY_BASE = 'https://api.apify.com/v2';
-const BATCH_SIZE = 50;                        // URLs per Apify run
+const BATCH_SIZE = 50;                        // URLs per Apify ru
 const BATCH_MEMORY_MB = 2048;                 // 2 GB per run
 const MAX_CONCURRENT_RUNS = 4;                // 4 × 2 GB = 8 GB (within Free plan)
 
