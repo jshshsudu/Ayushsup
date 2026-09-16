@@ -1,7 +1,5 @@
 const express = require('express');
-const multer = require('multer');
 const pLimit = require('p-limit');
-const { parsePlaylist } = require('iptv-m3u-playlist-parser');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,36 +15,46 @@ if (!APIFY_TOKEN) {
 // ---------------------------------------------------------------------------
 const APIFY_ACTOR = 'apify~cheerio-scraper';
 const APIFY_BASE = 'https://api.apify.com/v2';
-const BATCH_SIZE = 50;
-const MAX_CONCURRENT_RUNS = 2;
-const REFRESH_BUFFER_SECONDS = 1800;
-const MEMORY_MB = 4096;
-const POLL_INTERVAL_MS = 3000;
+const MAX_CONCURRENT_RUNS = 25;      // 25 Apify runs in parallel
+const MEMORY_MB = 256;               // 256 MB per run (single HEAD is tiny)
+const REFRESH_BUFFER_SECONDS = 1800; // Refresh 30 min before expiry
+const RETRY_DELAY_MS = 120_000;      // Retry failed channels after 2 min
+
+// Global concurrency gate — shared by initial batch AND refreshes
+const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
 // ---------------------------------------------------------------------------
 //  IN-MEMORY STORAGE
 // ---------------------------------------------------------------------------
 const channelStore = new Map();
+// channelId -> { channelId, name, originalUrl, currentUrl, cookie, expires, lastUpdated, status, error }
 
-const processingState = {
-    isProcessing: false,
-    totalChannels: 0,
-    processedChannels: 0,
-    failedChannels: 0,
-    currentBatch: 0,
-    totalBatches: 0,
+const stats = {
+    totalAdded: 0,
+    queued: 0,
+    processing: 0,
+    succeeded: 0,
+    failed: 0,
+    refreshCount: 0,
     startedAt: null,
-    finishedAt: null,
-    errors: [],
-    lastLog: '',
+    lastEventAt: null,
 };
+
+const eventLog = [];
+function log(msg, level = 'info') {
+    const entry = { time: getFormattedDate(), msg, level };
+    eventLog.push(entry);
+    if (eventLog.length > 500) eventLog.shift();
+    const prefix = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
+    console.log(`${prefix} ${msg}`);
+}
 
 // ---------------------------------------------------------------------------
 //  HELPERS
 // ---------------------------------------------------------------------------
 function getFormattedDate() {
     const d = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} ${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')} ${String(d.getDate()).padStart(2, '0')}-${String(d.getMonth() + 1).padStart(2, '0')}-${d.getFullYear()}`;
 }
 
 function extractExpiry(cookieStr) {
@@ -54,29 +62,20 @@ function extractExpiry(cookieStr) {
     return match ? parseInt(match[1], 10) : 0;
 }
 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function chunkArray(arr, size) {
-    const chunks = [];
-    for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
-    return chunks;
-}
-
 // ---------------------------------------------------------------------------
-//  APIFY HELPERS
+//  APIFY: SINGLE-URL RUN
+//  1 URL = 1 run = 1 result, so cookie mismatch is impossible.
 // ---------------------------------------------------------------------------
-async function startApifyRun(urls, memoryMb = MEMORY_MB) {
-    const startUrls = urls.map(u => ({ url: u, method: 'HEAD' }));
-
+async function runApifySingle(url) {
     const apifyInput = {
-        startUrls,
+        startUrls: [{ url, method: 'HEAD' }],
         proxyConfiguration: {
             useApifyProxy: true,
             apifyProxyGroups: ['RESIDENTIAL'],
             apifyProxyCountry: 'IN',
         },
-        maxConcurrency: 50,
-        maxRequestsPerCrawl: 0,
+        maxConcurrency: 1,
+        maxRequestsPerCrawl: 1,
         additionalMimeTypes: ['*/*'],
         ignoreSslErrors: true,
         pageFunction: `async function pageFunction(context) {
@@ -88,238 +87,191 @@ async function startApifyRun(urls, memoryMb = MEMORY_MB) {
         }`,
     };
 
-    const url = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${APIFY_TOKEN}&memory=${memoryMb}`;
-    const res = await fetch(url, {
+    const apiUrl = `${APIFY_BASE}/acts/${APIFY_ACTOR}/run-sync-get-dataset-items?token=${APIFY_TOKEN}&memory=${MEMORY_MB}`;
+
+    const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(apifyInput),
     });
-    if (!res.ok) throw new Error(`Apify start failed (${res.status}): ${await res.text()}`);
-    return (await res.json()).data;
-}
 
-async function waitForRun(runId) {
-    const url = `${APIFY_BASE}/actor-runs/${runId}?token=${APIFY_TOKEN}`;
-    while (true) {
-        await sleep(POLL_INTERVAL_MS);
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`Apify poll failed (${res.status})`);
-        const data = await res.json();
-        const status = data.data.status;
-        if (['SUCCEEDED', 'FAILED', 'ABORTED', 'TIMED-OUT'].includes(status)) return data.data;
+    if (!res.ok) {
+        throw new Error(`Apify HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
     }
-}
 
-async function fetchDatasetItems(datasetId) {
-    const url = `${APIFY_BASE}/datasets/${datasetId}/items?token=${APIFY_TOKEN}&clean=true`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Dataset fetch failed (${res.status})`);
-    return res.json();
-}
-
-async function processBatch(urls) {
-    const run = await startApifyRun(urls);
-    const finished = await waitForRun(run.id);
-    if (finished.status !== 'SUCCEEDED') {
-        throw new Error(`Apify run ${run.id} ended with status: ${finished.status}`);
+    const items = await res.json();
+    if (!Array.isArray(items) || items.length === 0) {
+        throw new Error('Apify returned 0 dataset items');
     }
-    return fetchDatasetItems(finished.defaultDatasetId);
+
+    return items[0];
 }
 
 // ---------------------------------------------------------------------------
-//  PER-CHANNEL REFRESH
+//  CORE: process one channel
 // ---------------------------------------------------------------------------
-async function refreshChannel(channelId) {
+async function processChannel(channelId) {
     const ch = channelStore.get(channelId);
     if (!ch) return;
 
-    try {
-        const results = await processBatch([ch.currentUrl]);
-        if (!results || results.length === 0) throw new Error('Empty Apify result');
+    channelStore.set(channelId, { ...ch, status: 'processing' });
+    stats.processing++;
 
-        const headers = results[0].headers || {};
-        let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
-        if (!setCookie) throw new Error('No set-cookie header');
+    try {
+        const item = await runApifySingle(ch.currentUrl || ch.originalUrl);
+
+        const headers = item.headers || {};
+        const setCookie = headers['set-cookie'] || headers['Set-Cookie'];
+
+        if (!setCookie) {
+            throw new Error(`No set-cookie header (HTTP ${item.status})`);
+        }
 
         const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
         const pureCookie = cookieStr.split(';')[0];
         const exp = extractExpiry(pureCookie);
-        if (exp <= 0) throw new Error('Cookie has no expiry');
+
+        if (exp <= 0) {
+            throw new Error('Cookie missing exp= parameter');
+        }
+
+        // Build new URL by replacing the __hdnea__ value
+        const baseUrl = ch.originalUrl.split('__hdnea__')[0];
+        const newUrl = baseUrl + pureCookie;
 
         const now = Math.floor(Date.now() / 1000);
         let waitSeconds = exp - now - REFRESH_BUFFER_SECONDS;
         if (waitSeconds < 60) waitSeconds = 60;
 
-        const newUrl = ch.currentUrl.replace(/__hdnea__=[^&]+/, pureCookie);
-
         channelStore.set(channelId, {
-            ...ch,
-            cookie: pureCookie,
+            channelId,
+            name: ch.name,
+            originalUrl: ch.originalUrl,
             currentUrl: newUrl,
+            cookie: pureCookie,
             expires: exp,
             lastUpdated: getFormattedDate(),
             status: 'active',
-            error: undefined,
+            error: null,
         });
 
-        setTimeout(() => refreshChannel(channelId), waitSeconds * 1000);
-        console.log(`✅ Refreshed ${channelId} (${ch.name}) — next in ${Math.round(waitSeconds / 60)} min`);
+        stats.processing--;
+        stats.succeeded++;
+        stats.lastEventAt = getFormattedDate();
+
+        log(`[${channelId}] active — next refresh in ${Math.round(waitSeconds / 60)} min`);
+
+        // Schedule next refresh through the shared gate
+        setTimeout(() => {
+            apifyLimit(() => processChannel(channelId)).catch(() => {});
+        }, waitSeconds * 1000);
+
     } catch (err) {
-        console.error(`❌ Refresh failed for ${channelId}: ${err.message}`);
+        stats.processing--;
+        stats.failed++;
+        stats.lastEventAt = getFormattedDate();
+
         const current = channelStore.get(channelId);
-        if (current) {
-            channelStore.set(channelId, { ...current, status: 'error', error: err.message });
-        }
-        setTimeout(() => refreshChannel(channelId), 120_000);
+        channelStore.set(channelId, {
+            ...(current || {}),
+            channelId,
+            name: ch.name,
+            originalUrl: ch.originalUrl,
+            currentUrl: ch.currentUrl || ch.originalUrl,
+            cookie: '',
+            expires: 0,
+            lastUpdated: getFormattedDate(),
+            status: 'error',
+            error: err.message,
+        });
+
+        log(`[${channelId}] FAILED: ${err.message}`, 'error');
+
+        setTimeout(() => {
+            apifyLimit(() => processChannel(channelId)).catch(() => {});
+        }, RETRY_DELAY_MS);
     }
 }
 
 // ---------------------------------------------------------------------------
-//  MASTER PROCESSOR
+//  QUEUE
 // ---------------------------------------------------------------------------
-async function processAllChannels(channels) {
-    const total = channels.length;
-    const batches = chunkArray(channels, BATCH_SIZE);
+function scheduleChannels(channels) {
+    stats.startedAt = stats.startedAt || getFormattedDate();
 
-    processingState.isProcessing = true;
-    processingState.totalChannels = total;
-    processingState.processedChannels = 0;
-    processingState.failedChannels = 0;
-    processingState.totalBatches = batches.length;
-    processingState.currentBatch = 0;
-    processingState.startedAt = getFormattedDate();
-    processingState.finishedAt = null;
-    processingState.errors = [];
-    processingState.lastLog = `Started ${total} channels in ${batches.length} batches`;
+    for (const ch of channels) {
+        const exists = channelStore.has(ch.channelId);
+        const prev = exists ? channelStore.get(ch.channelId) : null;
 
-    console.log(`🚀 [START] ${total} channels, ${batches.length} batches, ${MAX_CONCURRENT_RUNS} concurrent`);
+        channelStore.set(ch.channelId, {
+            channelId: ch.channelId,
+            name: ch.name || ch.channelId,
+            originalUrl: ch.url,
+            currentUrl: prev?.currentUrl || ch.url,
+            cookie: prev?.cookie || '',
+            expires: prev?.expires || 0,
+            lastUpdated: prev?.lastUpdated || '',
+            status: 'queued',
+            error: null,
+        });
 
-    const limit = pLimit(MAX_CONCURRENT_RUNS);
-    let batchCounter = 0;
+        if (!exists) stats.totalAdded++;
+        stats.queued++;
 
-    const tasks = batches.map(batch =>
-        limit(async () => {
-            const batchIndex = ++batchCounter;
-            processingState.currentBatch = batchIndex;
-            const urls = batch.map(ch => ch.url);
-            const ids = batch.map(ch => ch.channelId).join(',');
+        apifyLimit(() => processChannel(ch.channelId))
+            .then(() => { stats.queued--; })
+            .catch(() => { stats.queued--; });
+    }
 
-            console.log(`▶️  [BATCH ${batchIndex}] starting ${urls.length} urls: ${ids}`);
+    log(`Queued ${channels.length} channels. Active workers: ${apifyLimit.activeCount}, pending: ${apifyLimit.pendingCount}`);
+}
 
-            try {
-                const results = await processBatch(urls);
+// ---------------------------------------------------------------------------
+//  INPUT PARSER — accepts JSON array of {Id, url}
+// ---------------------------------------------------------------------------
+function parseChannelInput(text) {
+    const trimmed = text.trim();
+    if (!trimmed) return [];
 
-                console.log(`◀️  [BATCH ${batchIndex}] got ${Array.isArray(results) ? results.length : 'NON-ARRAY'} results`);
-
-                if (!Array.isArray(results)) {
-                    throw new Error(`Apify returned non-array: ${JSON.stringify(results).slice(0, 200)}`);
-                }
-
-                for (let i = 0; i < batch.length; i++) {
-                    const ch = batch[i];
-                    const item = results[i];
-
-                    if (!item) {
-                        processingState.failedChannels++;
-                        processingState.processedChannels++;
-                        channelStore.set(ch.channelId, {
-                            channelId: ch.channelId, name: ch.name,
-                            originalUrl: ch.url, currentUrl: ch.url,
-                            cookie: '', expires: 0, lastUpdated: '',
-                            status: 'failed', error: 'No result returned for index ' + i,
-                        });
-                        console.warn(`  ⚠️ [${ch.channelId}] no result`);
-                        continue;
-                    }
-
-                    const headers = item.headers || {};
-                    let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
-
-                    if (!setCookie) {
-                        processingState.failedChannels++;
-                        processingState.processedChannels++;
-                        channelStore.set(ch.channelId, {
-                            channelId: ch.channelId, name: ch.name,
-                            originalUrl: ch.url, currentUrl: ch.url,
-                            cookie: '', expires: 0, lastUpdated: '',
-                            status: 'no_cookie', error: 'No set-cookie header. Status: ' + item.status,
-                        });
-                        console.warn(`  ⚠️ [${ch.channelId}] no set-cookie (status=${item.status})`);
-                        continue;
-                    }
-
-                    const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
-                    const pureCookie = cookieStr.split(';')[0];
-                    const exp = extractExpiry(pureCookie);
-
-                    if (exp <= 0) {
-                        processingState.failedChannels++;
-                        processingState.processedChannels++;
-                        channelStore.set(ch.channelId, {
-                            channelId: ch.channelId, name: ch.name,
-                            originalUrl: ch.url, currentUrl: ch.url,
-                            cookie: pureCookie, expires: 0,
-                            lastUpdated: getFormattedDate(),
-                            status: 'no_expiry', error: 'Cookie missing exp=',
-                        });
-                        console.warn(`  ⚠️ [${ch.channelId}] cookie has no exp`);
-                        continue;
-                    }
-
-                    const now = Math.floor(Date.now() / 1000);
-                    let waitSeconds = exp - now - REFRESH_BUFFER_SECONDS;
-                    if (waitSeconds < 60) waitSeconds = 60;
-
-                    const newUrl = ch.url.replace(/__hdnea__=[^&]+/, pureCookie);
-
-                    channelStore.set(ch.channelId, {
-                        channelId: ch.channelId, name: ch.name,
-                        originalUrl: ch.url, currentUrl: newUrl,
-                        cookie: pureCookie, expires: exp,
-                        lastUpdated: getFormattedDate(),
-                        status: 'active',
-                    });
-
-                    setTimeout(() => refreshChannel(ch.channelId), waitSeconds * 1000);
-                    processingState.processedChannels++;
-                    console.log(`  ✅ [${ch.channelId}] active (expires in ${Math.round((exp-now)/60)} min)`);
-                }
-            } catch (err) {
-                console.error(`❌ [BATCH ${batchIndex}] FAILED: ${err.message}`);
-                console.error(err.stack);
-                processingState.errors.push(`Batch ${batchIndex}: ${err.message}`);
-
-                for (const ch of batch) {
-                    processingState.failedChannels++;
-                    processingState.processedChannels++;
-                    channelStore.set(ch.channelId, {
-                        channelId: ch.channelId, name: ch.name,
-                        originalUrl: ch.url, currentUrl: ch.url,
-                        cookie: '', expires: 0, lastUpdated: '',
-                        status: 'failed', error: err.message,
-                    });
-                }
-            }
-        })
-    );
-
+    // Try JSON first
     try {
-        await Promise.all(tasks);
-    } catch (e) {
-        console.error('❌ [GLOBAL] processAllChannels crashed:', e);
-        processingState.errors.push('Global: ' + e.message);
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+            return parsed
+                .map(item => {
+                    const channelId = String(item.Id ?? item.id ?? item.channelId ?? item.channel_id ?? '').trim();
+                    const url = String(item.url ?? item.URL ?? '').trim();
+                    if (!channelId || !url.startsWith('http')) return null;
+                    return { channelId, name: item.name || channelId, url };
+                })
+                .filter(Boolean);
+        }
+    } catch (_) {
+        // fall through to line-based parsing
     }
 
-    processingState.isProcessing = false;
-    processingState.finishedAt = getFormattedDate();
-    processingState.lastLog = `Finished. Active: ${[...channelStore.values()].filter(c => c.status === 'active').length}, Failed: ${processingState.failedChannels}`;
-    console.log(`🏁 [DONE] ${processingState.lastLog}`);
-}
+    // Fallback: line-based
+    const lines = trimmed.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+    const channels = [];
 
-// ---------------------------------------------------------------------------
-//  MULTER
-// ---------------------------------------------------------------------------
-const upload = multer({ storage: multer.memoryStorage() });
+    for (const line of lines) {
+        let parts;
+        if (line.includes('|')) parts = line.split('|').map(s => s.trim());
+        else if (line.includes('\t')) parts = line.split('\t').map(s => s.trim());
+        else parts = line.split(/\s+/).map(s => s.trim());
+
+        const url = parts.find(p => p.startsWith('http'));
+        if (!url) continue;
+
+        const nonUrl = parts.filter(p => p && !p.startsWith('http'));
+        const channelId = nonUrl[0] || `ch-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const name = nonUrl[1] || channelId;
+
+        channels.push({ channelId: String(channelId), name, url });
+    }
+
+    return channels;
+}
 
 // ---------------------------------------------------------------------------
 //  ROUTES
@@ -327,6 +279,7 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 app.get('/', (req, res) => res.send('OK'));
 
+// ---- Admin page ----
 app.get('/ayush8481/admin', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -335,175 +288,215 @@ app.get('/ayush8481/admin', (req, res) => {
 <title>JioTV Admin</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px;font-size:14px}
 h1{font-size:1.5rem;margin-bottom:16px;color:#38bdf8}
 h2{font-size:1.1rem;margin:16px 0 8px;color:#94a3b8}
 .card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
 .stat{background:#0f172a;border-radius:8px;padding:12px}
-.stat-label{font-size:.75rem;color:#64748b;text-transform:uppercase}
-.stat-value{font-size:1.4rem;font-weight:700;color:#38bdf8}
+.stat-label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
+.stat-value{font-size:1.3rem;font-weight:700;color:#38bdf8;margin-top:4px}
 .green{color:#4ade80!important}.red{color:#f87171!important}.yellow{color:#facc15!important}
-input[type=file]{display:block;margin:12px 0;color:#cbd5e1}
-button{background:#38bdf8;color:#0f172a;border:none;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer}
+textarea{width:100%;min-height:240px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5}
+textarea:focus{outline:none;border-color:#38bdf8}
+button{background:#38bdf8;color:#0f172a;border:none;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;margin-right:8px;margin-top:8px}
 button:disabled{opacity:.5;cursor:not-allowed}
 button.secondary{background:#334155;color:#e2e8f0}
-.log{background:#0f172a;border-radius:8px;padding:12px;font-family:monospace;font-size:.8rem;max-height:400px;overflow-y:auto;white-space:pre-wrap}
+button.danger{background:#7f1d1d;color:#fecaca}
+.log{background:#0f172a;border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:12px;max-height:400px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
+.log .err{color:#f87171}
+.log .warn{color:#facc15}
 a{text-decoration:none}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #334155}
+th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
+.hint{color:#64748b;font-size:12px;margin-top:8px;line-height:1.6}
+code{background:#0f172a;padding:2px 6px;border-radius:4px;color:#38bdf8;font-size:12px}
+.progress{background:#0f172a;border-radius:8px;height:8px;overflow:hidden;margin-top:8px}
+.progress-bar{background:linear-gradient(90deg,#38bdf8,#4ade80);height:100%;transition:width .3s}
 </style>
 </head>
 <body>
 <h1>JioTV Cookie Manager</h1>
+
 <div class="card">
-  <h2>Upload M3U8 Playlist</h2>
-  <form id="uploadForm" enctype="multipart/form-data">
-    <input type="file" name="playlist" accept=".m3u8,.m3u,.txt" required>
-    <button type="submit" id="uploadBtn">Upload &amp; Process</button>
-  </form>
+  <h2>Paste JSON (100 channels OK — 25 process in parallel)</h2>
+  <textarea id="input" placeholder='[
+  {"Id":"105","url":"https://jiotvpllive.cdn.jio.com/bpk-tv/.../index.mpd?__hdnea__=..."},
+  {"Id":"106","url":"https://jiotvpllive.cdn.jio.com/bpk-tv/.../index.mpd?__hdnea__=..."}
+]'></textarea>
+  <div class="hint">Accepts JSON array <code>[{"Id":"...","url":"..."}]</code>. Also supports line format: <code>Id|url</code>.</div>
+  <button id="processBtn" onclick="processInput()">▶ Add to Queue</button>
+  <button class="secondary" onclick="refreshAll()">🔄 Refresh All Active</button>
+  <button class="danger" onclick="clearAll()">🗑 Clear All</button>
+  <a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
 </div>
+
 <div class="card">
   <h2>Status</h2>
   <div class="grid">
-    <div class="stat"><div class="stat-label">Total</div><div class="stat-value" id="total">0</div></div>
-    <div class="stat"><div class="stat-label">Processed</div><div class="stat-value yellow" id="processed">0</div></div>
-    <div class="stat"><div class="stat-label">Active</div><div class="stat-value green" id="active">0</div></div>
-    <div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="failed">0</div></div>
-    <div class="stat"><div class="stat-label">Batch</div><div class="stat-value" id="batch">0/0</div></div>
+    <div class="stat"><div class="stat-label">Total Tracked</div><div class="stat-value" id="s-total">0</div></div>
+    <div class="stat"><div class="stat-label">Active</div><div class="stat-value green" id="s-active">0</div></div>
+    <div class="stat"><div class="stat-label">Processing</div><div class="stat-value yellow" id="s-processing">0</div></div>
+    <div class="stat"><div class="stat-label">Queued</div><div class="stat-value yellow" id="s-queued">0</div></div>
+    <div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="s-failed">0</div></div>
+    <div class="stat"><div class="stat-label">Succeeded</div><div class="stat-value green" id="s-succeeded">0</div></div>
+    <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/25</div></div>
   </div>
-  <div style="margin-top:12px">
-    <button class="secondary" onclick="refreshAll()">🔄 Refresh All</button>
-    <button class="secondary" onclick="loadStatus()">📊 Refresh Status</button>
-    <a href="/jiostb.json" target="_blank"><button class="secondary">📥 View jiostb.json</button></a>
-    <a href="/debug/state" target="_blank"><button class="secondary">🔍 Debug State</button></a>
-    <a href="/debug/test-apify" target="_blank"><button class="secondary">⚡ Test Apify</button></a>
-    <a href="/debug/test-parse" target="_blank"><button class="secondary">📄 Test Parser</button></a>
-  </div>
+  <div class="progress"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
 </div>
-<div class="card"><h2>Log</h2><div class="log" id="log">Waiting…</div></div>
+
+<div class="card">
+  <h2>Channels</h2>
+  <table>
+    <thead><tr><th>ID</th><th>Status</th><th>Expires In</th><th>Updated</th><th>Error</th></tr></thead>
+    <tbody id="channels"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>Event Log</h2>
+  <div class="log" id="log">Waiting…</div>
+</div>
+
 <script>
 async function loadStatus(){
   try{
-    const r=await fetch('/ayush8481/status');
-    const d=await r.json();
-    total.textContent=d.totalChannels;
-    processed.textContent=d.processedChannels;
-    active.textContent=d.activeChannels;
-    failed.textContent=d.failedChannels;
-    batch.textContent=d.currentBatch+'/'+d.totalBatches;
-    document.getElementById('log').textContent=d.log||'No log yet.';
-  }catch(e){document.getElementById('log').textContent='Error: '+e.message;}
+    const r = await fetch('/ayush8481/status');
+    const d = await r.json();
+    document.getElementById('s-total').textContent = d.stats.totalAdded;
+    document.getElementById('s-active').textContent = d.stats.active;
+    document.getElementById('s-processing').textContent = d.stats.processing;
+    document.getElementById('s-queued').textContent = d.stats.queued;
+    document.getElementById('s-failed').textContent = d.stats.failed;
+    document.getElementById('s-succeeded').textContent = d.stats.succeeded;
+    document.getElementById('s-workers').textContent = d.workerActive + '/' + d.workerMax;
+
+    const total = d.stats.totalAdded || 1;
+    const done = d.stats.active + d.stats.failed;
+    document.getElementById('progressBar').style.width = Math.min(100, Math.round(done/total*100)) + '%';
+
+    const tbody = document.getElementById('channels');
+    tbody.innerHTML = '';
+    for(const c of d.channels.slice(0, 200)){
+      const tr = document.createElement('tr');
+      const expTxt = c.expires ? Math.max(0, Math.round((c.expires - Date.now()/1000)/60)) + ' min' : '—';
+      let cls = '';
+      if(c.status === 'active') cls = 'green';
+      else if(c.status === 'error' || c.status === 'failed') cls = 'red';
+      else cls = 'yellow';
+      tr.innerHTML = '<td>'+c.channelId+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td><td>'+(c.lastUpdated||'')+'</td><td style="color:#f87171">'+(c.error||'')+'</td>';
+      tbody.appendChild(tr);
+    }
+
+    const logEl = document.getElementById('log');
+    logEl.innerHTML = d.log.slice(-80).map(e => {
+      const cls = e.level === 'error' ? 'err' : e.level === 'warn' ? 'warn' : '';
+      return '<div class="'+cls+'">'+e.time+'  '+e.msg+'</div>';
+    }).join('') || 'No events yet.';
+    logEl.scrollTop = logEl.scrollHeight;
+  } catch(e){ console.error(e); }
 }
-document.getElementById('uploadForm').addEventListener('submit',async e=>{
-  e.preventDefault();
-  const btn=document.getElementById('uploadBtn');
-  btn.disabled=true;btn.textContent='Processing…';
+
+async function processInput(){
+  const btn = document.getElementById('processBtn');
+  const text = document.getElementById('input').value.trim();
+  if(!text) return alert('Paste some channels first.');
+  btn.disabled = true; btn.textContent = 'Adding…';
   try{
-    const res=await fetch('/ayush8481/upload',{method:'POST',body:new FormData(e.target)});
-    const d=await res.json();
-    if(d.error)throw new Error(d.error);
-    document.getElementById('log').textContent='✅ Upload accepted ('+d.channelCount+' channels). Processing started…';
-  }catch(err){document.getElementById('log').textContent='❌ '+err.message;}
-  btn.disabled=false;btn.textContent='Upload & Process';
+    const r = await fetch('/ayush8481/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ input: text })
+    });
+    const d = await r.json();
+    if(d.error) throw new Error(d.error);
+    document.getElementById('input').value = '';
+    alert('✅ Added ' + d.added + ' channels to queue.');
+  } catch(e){ alert('❌ ' + e.message); }
+  btn.disabled = false; btn.textContent = '▶ Add to Queue';
   loadStatus();
-});
-async function refreshAll(){
-  const b=event.target;b.disabled=true;b.textContent='Refreshing…';
-  try{
-    const r=await fetch('/ayush8481/refresh-all',{method:'POST'});
-    const d=await r.json();
-    document.getElementById('log').textContent=d.message||'Refresh triggered.';
-  }catch(e){document.getElementById('log').textContent='❌ '+e.message;}
-  b.disabled=false;b.textContent='🔄 Refresh All';
 }
-loadStatus();setInterval(loadStatus,5000);
+
+async function refreshAll(){
+  if(!confirm('Re-process ALL channels in the store?')) return;
+  const r = await fetch('/ayush8481/refresh-all', {method:'POST'});
+  const d = await r.json();
+  alert(d.message || 'Done');
+  loadStatus();
+}
+
+async function clearAll(){
+  if(!confirm('Clear all channels?')) return;
+  await fetch('/ayush8481/clear', {method:'POST'});
+  loadStatus();
+}
+
+loadStatus();
+setInterval(loadStatus, 3000);
 </script>
 </body></html>`);
 });
 
-app.post('/ayush8481/upload', upload.single('playlist'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
-
+// ---- Add channels ----
+app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
     try {
-        const text = req.file.buffer.toString('utf8');
-        console.log(`📥 Upload received: ${req.file.size} bytes`);
-
-        const parsed = parsePlaylist(text);
-
-        if (!parsed.items || parsed.items.length === 0) {
-            console.error('❌ Parser returned 0 items');
-            return res.status(400).json({ error: 'No channels found in playlist. Check format.' });
-        }
-
-        console.log(`📄 Parsed ${parsed.items.length} channels`);
-
-        const channels = parsed.items.map(item => ({
-            channelId: String(item.tvg?.id || item.name || `ch-${Math.random().toString(36).slice(2, 8)}`),
-            name: item.name || 'Unknown',
-            url: item.url,
-        })).filter(ch => ch.url && ch.url.startsWith('http'));
+        const text = req.body.input || '';
+        const channels = parseChannelInput(text);
 
         if (channels.length === 0) {
-            return res.status(400).json({ error: 'No valid URLs found in playlist.' });
+            return res.status(400).json({ error: 'No valid channels found. Expected JSON array [{"Id":"...","url":"..."}]' });
         }
 
-        console.log(`✅ ${channels.length} valid channels after filtering`);
-
-        processAllChannels(channels).catch(e => {
-            console.error('❌ Background processing crashed:', e);
-        });
-
-        res.json({ success: true, channelCount: channels.length });
+        scheduleChannels(channels);
+        res.json({ success: true, added: channels.length });
     } catch (err) {
-        console.error('❌ Upload parse error:', err);
-        res.status(500).json({ error: `Failed to parse playlist: ${err.message}` });
+        log(`Add failed: ${err.message}`, 'error');
+        res.status(500).json({ error: err.message });
     }
 });
 
+// ---- Status ----
 app.get('/ayush8481/status', (req, res) => {
     const all = [...channelStore.values()];
     const active = all.filter(c => c.status === 'active').length;
-    const failed = all.filter(c => c.status !== 'active').length;
-
-    let log;
-    if (processingState.errors.length > 0) {
-        log = processingState.errors.slice(-20).join('\n');
-    } else if (processingState.isProcessing) {
-        log = `Processing batch ${processingState.currentBatch}/${processingState.totalBatches}…\n` + processingState.lastLog;
-    } else if (processingState.finishedAt) {
-        log = processingState.lastLog + '\nFinished at ' + processingState.finishedAt;
-    } else {
-        log = 'Idle. Upload an M3U8 to begin.';
-    }
 
     res.json({
-        isProcessing: processingState.isProcessing,
-        totalChannels: processingState.totalChannels,
-        processedChannels: processingState.processedChannels,
-        activeChannels: active,
-        failedChannels: failed,
-        currentBatch: processingState.currentBatch,
-        totalBatches: processingState.totalBatches,
-        startedAt: processingState.startedAt,
-        finishedAt: processingState.finishedAt,
-        log,
+        stats: { ...stats, active },
+        workerActive: apifyLimit.activeCount,
+        workerMax: MAX_CONCURRENT_RUNS,
+        channels: all,
+        log: eventLog.slice(-100),
     });
 });
 
-app.post('/ayush8481/refresh-all', async (req, res) => {
-    const channels = [...channelStore.values()].map(c => ({
-        channelId: c.channelId,
-        name: c.name,
-        url: c.currentUrl || c.originalUrl,
-    }));
+// ---- Refresh all ----
+app.post('/ayush8481/refresh-all', (req, res) => {
+    const active = [...channelStore.values()].filter(c => c.status === 'active' || c.status === 'error');
+    if (active.length === 0) return res.json({ message: 'No active channels.' });
 
-    if (channels.length === 0) {
-        return res.json({ message: 'No channels loaded. Upload a playlist first.' });
+    for (const c of active) {
+        c.status = 'queued';
+        apifyLimit(() => processChannel(c.channelId)).catch(() => {});
     }
-
-    processAllChannels(channels).catch(e => console.error(e));
-    res.json({ message: `Refresh triggered for ${channels.length} channels.` });
+    stats.refreshCount += active.length;
+    log(`Manual refresh triggered for ${active.length} channels.`);
+    res.json({ message: `Refreshing ${active.length} channels.` });
 });
 
+// ---- Clear ----
+app.post('/ayush8481/clear', (req, res) => {
+    channelStore.clear();
+    stats.totalAdded = 0;
+    stats.queued = 0;
+    stats.succeeded = 0;
+    stats.failed = 0;
+    stats.refreshCount = 0;
+    log('Store cleared.');
+    res.json({ ok: true });
+});
+
+// ---- Public JSON ----
 app.get('/jiostb.json', (req, res) => {
     const result = [...channelStore.values()]
         .filter(c => c.status === 'active')
@@ -516,65 +509,42 @@ app.get('/jiostb.json', (req, res) => {
     res.json(result);
 });
 
-// ---------------------------------------------------------------------------
-//  DIAGNOSTIC ENDPOINTS
-// ---------------------------------------------------------------------------
+// ---- Diagnostics ----
+app.get('/debug/state', (req, res) => {
+    res.json({
+        stats,
+        workerActive: apifyLimit.activeCount,
+        workerPending: apifyLimit.pendingCount,
+        workerMax: MAX_CONCURRENT_RUNS,
+        nodeVersion: process.version,
+        hasApifyToken: !!APIFY_TOKEN,
+        channelCount: channelStore.size,
+        log: eventLog.slice(-200),
+    });
+});
 
 app.get('/debug/test-apify', async (req, res) => {
     const testUrl = 'https://jiotvpllive.cdn.jio.com/bpk-tv/Star_Sports_HD1_BTS/WDVLive/index.mpd?__hdnea__=st=1789546555~exp=1789568155~acl=/bpk-tv/Star_Sports_HD1_BTS/WDVLive/*~hmac=22eeb22a986a4f91a19ed2cb016c800ea412aaae2fe769b0962b03e31e19590f';
     try {
-        console.log('🧪 Testing Apify...');
-        const run = await startApifyRun([testUrl]);
-        res.json({ ok: true, message: 'Apify run started', runId: run.id, status: run.status });
-    } catch (e) {
-        console.error('❌ Apify test failed:', e.message);
-        res.status(500).json({ ok: false, error: e.message, stack: e.stack });
-    }
-});
-
-app.get('/debug/test-parse', (req, res) => {
-    const sample = `#EXTM3U
-#EXTINF:-1 tvg-id="167" tvg-name="Zee TV HD" tvg-logo="https://img.media.jio.com/tvpimages/66/3/300378_1753869902174_l_medium.jpg" group-title="Entertainment",Zee TV HD
-#KODIPROP:inputstream=inputstream.adaptive
-#KODIPROP:inputstream.adaptive.manifest_type=mpd
-#KODIPROP:inputstream.adaptive.license_type=clearkey
-#KODIPROP:inputstream.adaptive.license_key=a23b609b33e254a48e4fc6fa7af0fd8d:4064c52328bfe9e6008776b48a431e4b
-https://jiotvpllive.cdn.jio.com/bpk-tv/ZeeTVHD_BTS/WDVLive/index.mpd?__hdnea__=st=1789558513~exp=1789580113~acl=/bpk-tv/ZeeTVHD_BTS/WDVLive/*~hmac=0e963dd530f7d872a6edc6e3141e8e81414f8da948a80168dfa239271f00fd8c`;
-    try {
-        const parsed = parsePlaylist(sample);
+        const item = await runApifySingle(testUrl);
         res.json({
             ok: true,
-            itemCount: parsed.items.length,
-            firstItem: parsed.items[0],
+            status: item.status,
+            hasSetCookie: !!(item.headers && (item.headers['set-cookie'] || item.headers['Set-Cookie'])),
+            cookiePreview: (item.headers?.['set-cookie'] || '').toString().slice(0, 80),
         });
     } catch (e) {
-        res.status(500).json({ ok: false, error: e.message, stack: e.stack });
+        res.status(500).json({ ok: false, error: e.message });
     }
-});
-
-app.get('/debug/state', (req, res) => {
-    const all = [...channelStore.values()];
-    res.json({
-        processingState,
-        channelCount: all.length,
-        activeCount: all.filter(c => c.status === 'active').length,
-        failedCount: all.filter(c => c.status !== 'active').length,
-        firstFive: all.slice(0, 5),
-        envCheck: {
-            hasApifyToken: !!APIFY_TOKEN,
-            tokenPrefix: APIFY_TOKEN ? APIFY_TOKEN.slice(0, 12) + '...' : null,
-            nodeVersion: process.version,
-        },
-    });
 });
 
 // ---------------------------------------------------------------------------
 //  START
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
-    console.log(`✅ JioTV Cookie Manager running on port ${PORT}`);
+    log(`Server started on port ${PORT}`);
+    log(`Concurrency: ${MAX_CONCURRENT_RUNS} × ${MEMORY_MB} MB = ${MAX_CONCURRENT_RUNS * MEMORY_MB} MB total`);
     console.log(`   Admin:   /ayush8481/admin`);
     console.log(`   Public:  /jiostb.json`);
     console.log(`   Node:    ${process.version}`);
-    console.log(`   Apify:   ${MAX_CONCURRENT_RUNS} runs × ${BATCH_SIZE} URLs = ${MAX_CONCURRENT_RUNS * BATCH_SIZE} parallel`);
 });
