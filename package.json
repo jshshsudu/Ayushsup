@@ -1,0 +1,14 @@
+{
+  "name": "jiotv-cookie-manager",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1",
+    "p-limit": "^3.1.0",
+    "iptv-playlist-parser": "^0.10.0"
+  }
+}
