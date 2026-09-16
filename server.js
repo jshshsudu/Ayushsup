@@ -15,27 +15,27 @@ if (!APIFY_TOKEN) {
 // ---------------------------------------------------------------------------
 const APIFY_ACTOR = 'apify~cheerio-scraper';
 const APIFY_BASE = 'https://api.apify.com/v2';
+const BATCH_SIZE = 50;                        // URLs per Apify run
+const BATCH_MEMORY_MB = 2048;                 // 2 GB per run
+const MAX_CONCURRENT_RUNS = 4;                // 4 × 2 GB = 8 GB (within Free plan)
 
-const BATCH_SIZE = 50;                // URLs per Apify run (normal channels)
-const BATCH_MEMORY_MB = 2048;         // 2 GB per batch run
-const SINGLE_MEMORY_MB = 256;         // 256 MB per single-URL run (special channels)
-const MAX_CONCURRENT_RUNS = 4;        // Apify Free plan limit is 5 — leave 1 spare
-const REFRESH_BUFFER_SECONDS = 1800;  // 30 min before expiry
-const RETRY_DELAY_MS = 120_000;       // Retry failed channel after 2 min
+const GROUP_SIZE = 200;                       // channels per refresh group
+const GROUP_STAGGER_MS = 5 * 60 * 1000;       // 5 min between initial upload groups
+const GROUP_REFRESH_INTERVAL_S = 5 * 3600;    // refresh each group every 5 hours
+const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;  // 30 min retry if a group refresh fails
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
 // ---------------------------------------------------------------------------
 //  STORAGE
 // ---------------------------------------------------------------------------
-const channelStore = new Map();
+const channelStore = new Map();   // channelId -> channel object (includes groupId)
+
+// groupId -> { groupId, channelIds:[], lastRefreshAt, nextRefreshAt, timer, processing }
+const groups = new Map();
 
 const stats = {
     totalAdded: 0,
-    normalCount: 0,
-    specialCount: 0,
-    queued: 0,
-    processing: 0,
     succeeded: 0,
     failed: 0,
     refreshCount: 0,
@@ -73,9 +73,6 @@ function chunkArray(arr, size) {
     return chunks;
 }
 
-// ---------------------------------------------------------------------------
-//  ACL EXTRACTION / NORMALISATION
-// ---------------------------------------------------------------------------
 function extractAclFromUrl(url) {
     const m = url.match(/~acl=([^~]+)~/);
     if (m) return m[1].trim();
@@ -99,45 +96,23 @@ function applyCookieToUrl(originalUrl, pureCookie) {
     return originalUrl.substring(0, idx + '__hdnea__='.length) + pureCookie;
 }
 
-// ---------------------------------------------------------------------------
-//  SPECIAL-CHANNEL DETECTION
-//
-//  A channel is "special" when the URL's own path (/bpk-tv/<X>/...) does NOT
-//  match the URL's own ~acl=/bpk-tv/<Y>/...~ value.
-//
-//  Reason: the CDN only returns cookies whose acl= matches the URL path it
-//  actually serves. For these mis-aliased entries, batching cannot resolve the
-//  mapping by ACL, so we must process them individually.
-//
-//  Example special URL:
-//    /bpk-tv/Dagdusheth_Pune_BTS/WDVLive/index.mpd?__hdnea__=...~acl=/bpk-tv/Dagdusheth_Ganpati/HLSPartner/*~...
-//  Example normal URL:
-//    /bpk-tv/ZeeTVHD_BTS/WDVLive/index.mpd?__hdnea__=...~acl=/bpk-tv/ZeeTVHD_BTS/WDVLive/*~...
-// ---------------------------------------------------------------------------
 function isSpecialChannel(url) {
     try {
         const u = new URL(url);
-        // Extract the /bpk-tv/<segment>/ part from the URL's own path
         const m = u.pathname.match(/^\/bpk-tv\/([^\/]+)/i);
-        if (!m) return true;                    // unknown path → treat as special
+        if (!m) return true;
         const urlSegment = m[1].toLowerCase();
-
         const acl = extractAclFromUrl(url);
-        if (!acl) return true;                  // no acl= → treat as special
-
-        // ACL must contain the same /bpk-tv/<segment>/ as the URL path
+        if (!acl) return true;
         return !acl.toLowerCase().includes(`/bpk-tv/${urlSegment}/`);
-    } catch {
-        return true;
-    }
+    } catch { return true; }
 }
 
 // ---------------------------------------------------------------------------
-//  APIFY: START / POLL / FETCH
+//  APIFY
 // ---------------------------------------------------------------------------
-async function startApifyRun(urls, memoryMb, maxConcurrency) {
+async function startApifyRun(urls) {
     const startUrls = urls.map(u => ({ url: u, method: 'HEAD' }));
-
     const apifyInput = {
         startUrls,
         proxyConfiguration: {
@@ -145,7 +120,7 @@ async function startApifyRun(urls, memoryMb, maxConcurrency) {
             apifyProxyGroups: ['RESIDENTIAL'],
             apifyProxyCountry: 'IN',
         },
-        maxConcurrency,
+        maxConcurrency: 50,
         maxRequestsPerCrawl: 0,
         additionalMimeTypes: ['*/*'],
         ignoreSslErrors: true,
@@ -157,16 +132,13 @@ async function startApifyRun(urls, memoryMb, maxConcurrency) {
             };
         }`,
     };
-
-    const apiUrl = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${APIFY_TOKEN}&memory=${memoryMb}`;
+    const apiUrl = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${APIFY_TOKEN}&memory=${BATCH_MEMORY_MB}`;
     const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(apifyInput),
     });
-    if (!res.ok) {
-        throw new Error(`Apify HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    }
+    if (!res.ok) throw new Error(`Apify HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
     return (await res.json()).data;
 }
 
@@ -189,33 +161,39 @@ async function fetchDatasetItems(datasetId) {
     return res.json();
 }
 
-async function runApify(urls, memoryMb, maxConcurrency) {
-    const run = await startApifyRun(urls, memoryMb, maxConcurrency);
+async function deleteDataset(datasetId) {
+    if (!datasetId) return;
+    try { await fetch(`${APIFY_BASE}/datasets/${datasetId}?token=${APIFY_TOKEN}`, { method: 'DELETE' }); } catch (_) {}
+}
+
+async function runApify(urls) {
+    const run = await startApifyRun(urls);
     const finished = await waitForRun(run.id);
     if (finished.status !== 'SUCCEEDED') {
+        await deleteDataset(finished.defaultDatasetId);
         throw new Error(`Apify run ${run.id} ended with status: ${finished.status}`);
     }
-    return fetchDatasetItems(finished.defaultDatasetId);
+    const items = await fetchDatasetItems(finished.defaultDatasetId);
+    deleteDataset(finished.defaultDatasetId).catch(() => {});
+    return items;
 }
 
 // ---------------------------------------------------------------------------
-//  NORMAL BATCH PROCESSING (50 URLs per run, 2 GB)
+//  BATCH PROCESSOR
 // ---------------------------------------------------------------------------
-async function processBatchOfChannels(channels, batchIndex) {
+async function processBatchOfChannels(channels, label) {
     const urls = channels.map(c => c.url);
-    log(`▶️  [BATCH ${batchIndex}] starting ${urls.length} urls @ ${BATCH_MEMORY_MB} MB`);
+    log(`▶️  [${label}] starting ${urls.length} urls`);
 
     for (const ch of channels) {
         const existing = channelStore.get(ch.channelId) || {};
         channelStore.set(ch.channelId, { ...existing, status: 'processing' });
     }
 
-    const results = await runApify(urls, BATCH_MEMORY_MB, 50);
+    const results = await runApify(urls);
     if (!Array.isArray(results)) throw new Error('Apify returned non-array');
+    log(`◀️  [${label}] got ${results.length} results`);
 
-    log(`◀️  [BATCH ${batchIndex}] got ${results.length} results`);
-
-    // Build ACL → cookie map from all returned cookies
     const aclToCookie = new Map();
     for (const item of results) {
         const headers = item.headers || {};
@@ -227,270 +205,220 @@ async function processBatchOfChannels(channels, batchIndex) {
         const acl = normaliseAcl(aclRaw);
         const exp = extractExpiry(cookieStr.split(';')[0]);
         const existing = aclToCookie.get(acl);
-        if (!existing || exp > existing.exp) {
-            aclToCookie.set(acl, { cookieStr, exp });
-        }
+        if (!existing || exp > existing.exp) aclToCookie.set(acl, { cookieStr, exp });
     }
-    log(`   [BATCH ${batchIndex}] ACL map has ${aclToCookie.size} unique ACLs`);
+    log(`   [${label}] ACL map: ${aclToCookie.size} unique`);
 
     let matched = 0, failed = 0;
 
     for (const ch of channels) {
         const aclUrl = normaliseAcl(extractAclFromUrl(ch.url));
-        if (!aclUrl) {
-            failed++;
-            channelStore.set(ch.channelId, {
-                channelId: ch.channelId, name: ch.name,
-                originalUrl: ch.url, currentUrl: ch.url,
-                cookie: '', expires: 0, lastUpdated: '',
-                status: 'failed', error: 'No ACL in URL',
-                isSpecial: false,
-            });
-            continue;
-        }
-
-        let hit = aclToCookie.get(aclUrl);
-        if (!hit) {
-            // Try prefix match on /bpk-tv/<segment>/
-            const prefix = aclUrl.split('/').slice(0, 4).join('/');
-            for (const [k, v] of aclToCookie.entries()) {
-                if (k.startsWith(prefix)) { hit = v; break; }
+        let hit = null;
+        if (aclUrl) {
+            hit = aclToCookie.get(aclUrl);
+            if (!hit) {
+                const prefix = aclUrl.split('/').slice(0, 4).join('/');
+                for (const [k, v] of aclToCookie.entries()) {
+                    if (k.startsWith(prefix)) { hit = v; break; }
+                }
             }
         }
+        if (!hit && isSpecialChannel(ch.url) && aclToCookie.size === 1) {
+            hit = aclToCookie.values().next().value;
+        }
 
         if (!hit) {
             failed++;
             channelStore.set(ch.channelId, {
+                ...(channelStore.get(ch.channelId) || {}),
                 channelId: ch.channelId, name: ch.name,
                 originalUrl: ch.url, currentUrl: ch.url,
                 cookie: '', expires: 0,
                 lastUpdated: getFormattedDate(),
-                status: 'no_cookie', error: `No cookie for ACL ${aclUrl}`,
-                isSpecial: false,
+                status: 'no_cookie', error: 'No cookie for ACL',
             });
-            log(`  ⚠️ [${ch.channelId}] no cookie for ACL ${aclUrl}`, 'warn');
             continue;
         }
 
         aclToCookie.delete(aclUrl);
 
-        const { cookieStr } = hit;
-        const pureCookie = cookieStr.split(';')[0];
+        const pureCookie = hit.cookieStr.split(';')[0];
         const exp = extractExpiry(pureCookie);
         if (exp <= 0) { failed++; continue; }
 
-        const now = Math.floor(Date.now() / 1000);
-        let waitSeconds = exp - now - REFRESH_BUFFER_SECONDS;
-        if (waitSeconds < 60) waitSeconds = 60;
-
         const newUrl = applyCookieToUrl(ch.url, pureCookie);
-
         channelStore.set(ch.channelId, {
+            ...(channelStore.get(ch.channelId) || {}),
             channelId: ch.channelId, name: ch.name,
             originalUrl: ch.url, currentUrl: newUrl,
             cookie: pureCookie, expires: exp,
             lastUpdated: getFormattedDate(),
             status: 'active', error: null,
-            isSpecial: false,
         });
-
-        setTimeout(() => apifyLimit(() => refreshChannel(ch.channelId)).catch(() => {}), waitSeconds * 1000);
         stats.succeeded++;
         matched++;
-        log(`  ✅ [${ch.channelId}] matched ACL ${aclUrl}`);
     }
 
     stats.failed += failed;
-    log(`   [BATCH ${batchIndex}] done: ${matched} matched, ${failed} failed, ${aclToCookie.size} unused`);
+    log(`   [${label}] matched ${matched}, failed ${failed}, unused ${aclToCookie.size}`);
 }
 
 // ---------------------------------------------------------------------------
-//  SPECIAL PROCESSING (1 URL per run, 256 MB)
+//  GROUP MANAGEMENT
 // ---------------------------------------------------------------------------
-async function processSpecialChannel(channelId, index, total) {
-    const ch = channelStore.get(channelId);
-    if (!ch) return;
+function createGroup(channelIds) {
+    const groupId = `grp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    groups.set(groupId, {
+        groupId,
+        channelIds: [...channelIds],
+        lastRefreshAt: null,
+        nextRefreshAt: null,
+        timer: null,
+        processing: false,
+    });
+    return groupId;
+}
 
-    channelStore.set(channelId, { ...ch, status: 'processing' });
+function scheduleGroupRefresh(groupId, delayMs) {
+    const g = groups.get(groupId);
+    if (!g) return;
+    if (g.timer) clearTimeout(g.timer);
+
+    g.nextRefreshAt = Math.floor(Date.now() / 1000) + Math.round(delayMs / 1000);
+    g.timer = setTimeout(() => {
+        processGroup(groupId).catch(e => log(`Group ${groupId} crashed: ${e.message}`, 'error'));
+    }, delayMs);
+
+    const when = new Date(g.nextRefreshAt * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
+    log(`⏰ [${groupId}] next refresh at ${when} IST`);
+}
+
+async function processGroup(groupId) {
+    const g = groups.get(groupId);
+    if (!g) return;
+    if (g.processing) {
+        log(`⚠️ [${groupId}] already processing, skipping`, 'warn');
+        return;
+    }
+    g.processing = true;
 
     try {
-        log(`▶️  [SPECIAL ${index}/${total}] ${channelId} @ ${SINGLE_MEMORY_MB} MB`);
-        const results = await runApify([ch.originalUrl], SINGLE_MEMORY_MB, 1);
-        if (!Array.isArray(results) || results.length === 0) {
-            throw new Error('Empty Apify result');
+        const activeChannels = g.channelIds
+            .map(id => channelStore.get(id))
+            .filter(c => c && (c.status === 'active' || c.status === 'error'));
+
+        if (activeChannels.length === 0) {
+            log(`⚠️ [${groupId}] no active channels, rescheduling`);
+            g.processing = false;
+            scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+            return;
         }
 
-        const headers = results[0].headers || {};
-        let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
-        if (!setCookie) throw new Error('No set-cookie header');
+        log(`🔄 [${groupId}] refreshing ${activeChannels.length} channels`);
 
-        const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
-        const pureCookie = cookieStr.split(';')[0];
-        const exp = extractExpiry(pureCookie);
-        if (exp <= 0) throw new Error('Cookie missing exp=');
+        const inputs = activeChannels.map(c => ({
+            channelId: c.channelId,
+            name: c.name,
+            url: c.originalUrl,
+        }));
 
-        const now = Math.floor(Date.now() / 1000);
-        let waitSeconds = exp - now - REFRESH_BUFFER_SECONDS;
-        if (waitSeconds < 60) waitSeconds = 60;
-
-        const newUrl = applyCookieToUrl(ch.originalUrl, pureCookie);
-
-        channelStore.set(channelId, {
-            channelId,
-            name: ch.name,
-            originalUrl: ch.originalUrl,
-            currentUrl: newUrl,
-            cookie: pureCookie,
-            expires: exp,
-            lastUpdated: getFormattedDate(),
-            status: 'active',
-            error: null,
-            isSpecial: true,       // ← marks this channel for single-URL refresh
-        });
-
-        stats.succeeded++;
-        log(`  ✅ [${channelId}] special OK (expires in ${Math.round((exp - now) / 60)} min)`);
-
-        setTimeout(() => apifyLimit(() => refreshChannel(channelId)).catch(() => {}), waitSeconds * 1000);
-    } catch (err) {
-        stats.failed++;
-        const current = channelStore.get(channelId) || ch;
-        channelStore.set(channelId, {
-            ...current,
-            status: 'error',
-            error: err.message,
-            isSpecial: true,
-        });
-        log(`  ❌ [${channelId}] special failed: ${err.message}`, 'error');
-
-        const delay = /402|concurrent-runs-limit/i.test(err.message) ? 5_000 : RETRY_DELAY_MS;
-        setTimeout(() => apifyLimit(() => processSpecialChannel(channelId, index, total)).catch(() => {}), delay);
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  PER-CHANNEL REFRESH (mode depends on isSpecial)
-// ---------------------------------------------------------------------------
-async function refreshChannel(channelId) {
-    const ch = channelStore.get(channelId);
-    if (!ch) return;
-
-    try {
-        // Special channels use single-URL run at 256 MB; normal channels use single-URL run too
-        // (single-URL refresh is same for both — the difference is memory and how it was first created)
-        const memoryMb = ch.isSpecial ? SINGLE_MEMORY_MB : SINGLE_MEMORY_MB;
-        const results = await runApify([ch.originalUrl], memoryMb, 1);
-        if (!results || results.length === 0) throw new Error('Empty Apify result');
-
-        const headers = results[0].headers || {};
-        let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
-        if (!setCookie) throw new Error('No set-cookie header');
-
-        const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
-        const pureCookie = cookieStr.split(';')[0];
-        const exp = extractExpiry(pureCookie);
-        if (exp <= 0) throw new Error('Cookie missing exp=');
-
-        // For normal channels: sanity-check ACL match (skip for special since they are known-mismatched)
-        if (!ch.isSpecial) {
-            const aclUrl = normaliseAcl(extractAclFromUrl(ch.originalUrl));
-            const aclCookie = normaliseAcl(extractAclFromCookie(cookieStr));
-            if (aclUrl && aclCookie && aclUrl !== aclCookie) {
-                throw new Error(`ACL mismatch: cookie=${aclCookie} url=${aclUrl}`);
-            }
-        }
-
-        const now = Math.floor(Date.now() / 1000);
-        let waitSeconds = exp - now - REFRESH_BUFFER_SECONDS;
-        if (waitSeconds < 60) waitSeconds = 60;
-
-        const newUrl = applyCookieToUrl(ch.originalUrl, pureCookie);
-
-        channelStore.set(channelId, {
-            ...ch,
-            currentUrl: newUrl,
-            cookie: pureCookie,
-            expires: exp,
-            lastUpdated: getFormattedDate(),
-            status: 'active',
-            error: null,
-        });
-
-        stats.refreshCount++;
-        setTimeout(() => apifyLimit(() => refreshChannel(channelId)).catch(() => {}), waitSeconds * 1000);
-        log(`[${channelId}] refreshed${ch.isSpecial ? ' (special)' : ''} — next in ${Math.round(waitSeconds / 60)} min`);
-    } catch (err) {
-        const current = channelStore.get(channelId);
-        if (current) channelStore.set(channelId, { ...current, status: 'error', error: err.message });
-        log(`[${channelId}] refresh failed: ${err.message}`, 'error');
-
-        const delay = /402|concurrent-runs-limit/i.test(err.message) ? 5_000 : RETRY_DELAY_MS;
-        setTimeout(() => apifyLimit(() => refreshChannel(channelId)).catch(() => {}), delay);
-    }
-}
-
-// ---------------------------------------------------------------------------
-//  MASTER PROCESSOR — splits normal vs special
-// ---------------------------------------------------------------------------
-async function processAllChannels(channels) {
-    // Split at input time
-    const normal = [];
-    const special = [];
-    for (const ch of channels) {
-        if (isSpecialChannel(ch.url)) special.push(ch);
-        else normal.push(ch);
-    }
-
-    stats.startedAt = stats.startedAt || getFormattedDate();
-    log(`🚀 [START] ${channels.length} channels → ${normal.length} normal (batched 50) + ${special.length} special (single 256 MB)`);
-    log(`   Free plan limit is 5 concurrent runs — using ${MAX_CONCURRENT_RUNS}.`);
-
-    // ---- 1) NORMAL CHANNELS (batched) ----
-    if (normal.length > 0) {
-        const batches = chunkArray(normal, BATCH_SIZE);
-        let batchCounter = 0;
-        const normalTasks = batches.map(batch =>
+        const batches = chunkArray(inputs, BATCH_SIZE);
+        let idx = 0;
+        const tasks = batches.map(batch =>
             apifyLimit(async () => {
-                const idx = ++batchCounter;
+                const label = `${groupId}-B${++idx}`;
                 try {
-                    await processBatchOfChannels(batch, idx);
+                    await processBatchOfChannels(batch, label);
+                    stats.refreshCount += batch.length;
                 } catch (err) {
-                    log(`❌ [BATCH ${idx}] ${err.message}`, 'error');
+                    log(`❌ [${label}] ${err.message}`, 'error');
                     for (const ch of batch) {
                         const cur = channelStore.get(ch.channelId) || {};
                         channelStore.set(ch.channelId, {
                             ...cur,
-                            channelId: ch.channelId,
-                            name: ch.name,
-                            originalUrl: ch.url,
-                            currentUrl: cur.currentUrl || ch.url,
                             status: 'error',
                             error: err.message,
-                            isSpecial: false,
+                        });
+                    }
+                }
+            })
+        );
+        await Promise.all(tasks);
+
+        g.lastRefreshAt = Math.floor(Date.now() / 1000);
+        g.processing = false;
+
+        // Schedule next refresh 5h from now
+        scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+    } catch (err) {
+        log(`❌ [${groupId}] group refresh failed: ${err.message}`, 'error');
+        g.processing = false;
+        // Retry sooner
+        scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  INITIAL PROCESSING — grouped with stagger
+// ---------------------------------------------------------------------------
+async function processAllChannels(channels) {
+    const channelGroups = chunkArray(channels, GROUP_SIZE);
+    log(`🚀 [START] ${channels.length} channels in ${channelGroups.length} groups of ${GROUP_SIZE} (stagger ${GROUP_STAGGER_MS / 60000} min)`);
+    stats.startedAt = stats.startedAt || getFormattedDate();
+
+    for (let i = 0; i < channelGroups.length; i++) {
+        const groupChannels = channelGroups[i];
+
+        // Create the group entry
+        const groupId = createGroup(groupChannels.map(c => c.channelId));
+
+        // Tag each channel with groupId
+        for (const ch of groupChannels) {
+            const cur = channelStore.get(ch.channelId) || {};
+            channelStore.set(ch.channelId, { ...cur, groupId });
+        }
+
+        log(`📦 [GROUP ${i + 1}/${channelGroups.length}] ${groupChannels.length} channels → ${groupId}`);
+
+        // Process the group in 50-batches (all through the shared apifyLimit)
+        const batches = chunkArray(groupChannels, BATCH_SIZE);
+        let idx = 0;
+        const tasks = batches.map(batch =>
+            apifyLimit(async () => {
+                const label = `${groupId}-B${++idx}`;
+                try {
+                    await processBatchOfChannels(batch, label);
+                } catch (err) {
+                    log(`❌ [${label}] ${err.message}`, 'error');
+                    for (const ch of batch) {
+                        const cur = channelStore.get(ch.channelId) || {};
+                        channelStore.set(ch.channelId, {
+                            ...cur, channelId: ch.channelId, name: ch.name,
+                            originalUrl: ch.url, currentUrl: cur.currentUrl || ch.url,
+                            status: 'error', error: err.message,
                         });
                         stats.failed++;
                     }
                 }
             })
         );
-        await Promise.all(normalTasks);
-    }
+        await Promise.all(tasks);
 
-    // ---- 2) SPECIAL CHANNELS (single-URL, 256 MB) ----
-    if (special.length > 0) {
-        let i = 0;
-        const specialTasks = special.map(ch =>
-            apifyLimit(async () => {
-                const idx = ++i;
-                await processSpecialChannel(ch.channelId, idx, special.length);
-            })
-        );
-        await Promise.all(specialTasks);
+        // Record completion time and schedule first refresh
+        const g = groups.get(groupId);
+        g.lastRefreshAt = Math.floor(Date.now() / 1000);
+        scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+
+        // Stagger before the next group
+        if (i < channelGroups.length - 1) {
+            log(`⏳ Waiting ${GROUP_STAGGER_MS / 60000} min before group ${i + 2}…`);
+            await sleep(GROUP_STAGGER_MS);
+        }
     }
 
     stats.lastEventAt = getFormattedDate();
     const active = [...channelStore.values()].filter(c => c.status === 'active').length;
-    log(`🏁 [DONE] Active: ${active}, Failed: ${stats.failed}`);
+    log(`🏁 [DONE] Active: ${active}, Failed: ${stats.failed}, Groups: ${groups.size}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -499,22 +427,17 @@ async function processAllChannels(channels) {
 function parseChannelInput(text) {
     const trimmed = text.trim();
     if (!trimmed) return [];
-
     try {
         const parsed = JSON.parse(trimmed);
         if (Array.isArray(parsed)) {
-            return parsed
-                .map(item => {
-                    const id = String(item.Id ?? item.id ?? item.channelId ?? item.channel_id ?? '').trim();
-                    const url = String(item.url ?? item.URL ?? '').trim();
-                    if (!id || !url.startsWith('http')) return null;
-                    return { channelId: id, name: item.name || id, url };
-                })
-                .filter(Boolean);
+            return parsed.map(item => {
+                const id = String(item.Id ?? item.id ?? item.channelId ?? item.channel_id ?? '').trim();
+                const url = String(item.url ?? item.URL ?? '').trim();
+                if (!id || !url.startsWith('http')) return null;
+                return { channelId: id, name: item.name || id, url };
+            }).filter(Boolean);
         }
     } catch (_) {}
-
-    // Fallback line-based
     const lines = trimmed.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
     const channels = [];
     for (const line of lines) {
@@ -538,181 +461,131 @@ app.get('/', (req, res) => res.send('OK'));
 
 app.get('/ayush8481/admin', (req, res) => {
     res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>JioTV Admin</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px;font-size:14px}
+body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:24px;font-size:14px}
 h1{font-size:1.5rem;margin-bottom:16px;color:#38bdf8}
 h2{font-size:1.1rem;margin:16px 0 8px;color:#94a3b8}
 .card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
 .stat{background:#0f172a;border-radius:8px;padding:12px}
-.stat-label{font-size:.7rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em}
+.stat-label{font-size:.7rem;color:#64748b;text-transform:uppercase}
 .stat-value{font-size:1.3rem;font-weight:700;color:#38bdf8;margin-top:4px}
-.green{color:#4ade80!important}.red{color:#f87171!important}.yellow{color:#facc15!important}.purple{color:#c084fc!important}
-textarea{width:100%;min-height:240px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;resize:vertical;line-height:1.5}
-textarea:focus{outline:none;border-color:#38bdf8}
+.green{color:#4ade80!important}.red{color:#f87171!important}.yellow{color:#facc15!important}
+textarea{width:100%;min-height:200px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:monospace;font-size:12px}
 button{background:#38bdf8;color:#0f172a;border:none;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;margin-right:8px;margin-top:8px}
-button:disabled{opacity:.5;cursor:not-allowed}
+button:disabled{opacity:.5}
 button.secondary{background:#334155;color:#e2e8f0}
 button.danger{background:#7f1d1d;color:#fecaca}
-.log{background:#0f172a;border-radius:8px;padding:12px;font-family:ui-monospace,monospace;font-size:12px;max-height:400px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
-.log .err{color:#f87171}
-.log .warn{color:#facc15}
+.log{background:#0f172a;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:400px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
+.log .err{color:#f87171}.log .warn{color:#facc15}
 a{text-decoration:none}
 table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #334155}
 th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
-.hint{color:#64748b;font-size:12px;margin-top:8px;line-height:1.6}
-code{background:#0f172a;padding:2px 6px;border-radius:4px;color:#38bdf8;font-size:12px}
-.progress{background:#0f172a;border-radius:8px;height:8px;overflow:hidden;margin-top:8px}
-.progress-bar{background:linear-gradient(90deg,#38bdf8,#4ade80);height:100%;transition:width .3s}
-</style>
-</head>
-<body>
+</style></head><body>
 <h1>JioTV Cookie Manager</h1>
-
-<div class="card">
-  <h2>Paste JSON (any size — normal in batches of 50, special 1-per-request @ 256 MB)</h2>
-  <textarea id="input" placeholder='[
-  {"Id":"167","url":"https://jiotvpllive.cdn.jio.com/bpk-tv/ZeeTVHD_BTS/WDVLive/index.mpd?__hdnea__=..."},
-  {"Id":"146","url":"https://jiotvpllive.cdn.jio.com/bpk-tv/History_HD_BTS/WDVLive/index.mpd?__hdnea__=..."}
-]'></textarea>
-  <div class="hint">
-    <strong>Normal:</strong> URL's own <code>~acl=/bpk-tv/X/…~</code> matches its own <code>/bpk-tv/X/</code> path → batched.<br>
-    <strong>Special:</strong> URL path and ACL path differ → processed one-by-one at 256 MB.
-  </div>
-  <button id="processBtn" onclick="processInput()">▶ Add to Queue</button>
-  <button class="secondary" onclick="refreshAll()">🔄 Refresh All</button>
-  <button class="danger" onclick="clearAll()">🗑 Clear All</button>
-  <a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
+<div class="card"><h2>Paste JSON</h2>
+<textarea id="input" placeholder='[{"Id":"167","url":"https://..."}]'></textarea>
+<button id="processBtn" onclick="processInput()">▶ Add to Queue</button>
+<button class="secondary" onclick="refreshAll()">🔄 Refresh All Groups</button>
+<button class="danger" onclick="clearAll()">🗑 Clear All</button>
+<a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
 </div>
-
-<div class="card">
-  <h2>Status</h2>
-  <div class="grid">
-    <div class="stat"><div class="stat-label">Total</div><div class="stat-value" id="s-total">0</div></div>
-    <div class="stat"><div class="stat-label">Active</div><div class="stat-value green" id="s-active">0</div></div>
-    <div class="stat"><div class="stat-label">Normal</div><div class="stat-value" id="s-normal">0</div></div>
-    <div class="stat"><div class="stat-label">Special</div><div class="stat-value purple" id="s-special">0</div></div>
-    <div class="stat"><div class="stat-label">Processing</div><div class="stat-value yellow" id="s-processing">0</div></div>
-    <div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="s-failed">0</div></div>
-    <div class="stat"><div class="stat-label">Succeeded</div><div class="stat-value green" id="s-succeeded">0</div></div>
-    <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/4</div></div>
-  </div>
-  <div class="progress"><div class="progress-bar" id="progressBar" style="width:0%"></div></div>
+<div class="card"><h2>Status</h2>
+<div class="grid">
+<div class="stat"><div class="stat-label">Total</div><div class="stat-value" id="s-total">0</div></div>
+<div class="stat"><div class="stat-label">Active</div><div class="stat-value green" id="s-active">0</div></div>
+<div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="s-failed">0</div></div>
+<div class="stat"><div class="stat-label">Groups</div><div class="stat-value" id="s-groups">0</div></div>
+<div class="stat"><div class="stat-label">Refreshes</div><div class="stat-value" id="s-refreshes">0</div></div>
+<div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/4</div></div>
 </div>
-
-<div class="card">
-  <h2>Channels</h2>
-  <table>
-    <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Status</th><th>Expires In</th><th>Updated</th><th>Error</th></tr></thead>
-    <tbody id="channels"></tbody>
-  </table>
 </div>
-
-<div class="card">
-  <h2>Event Log</h2>
-  <div class="log" id="log">Waiting…</div>
+<div class="card"><h2>Groups</h2>
+<table><thead><tr><th>Group</th><th>Channels</th><th>Last Refresh</th><th>Next Refresh</th><th>Status</th></tr></thead>
+<tbody id="groups"></tbody></table>
 </div>
-
+<div class="card"><h2>Channels</h2>
+<table><thead><tr><th>ID</th><th>Name</th><th>Group</th><th>Status</th><th>Expires In</th><th>Updated</th></tr></thead>
+<tbody id="channels"></tbody></table>
+</div>
+<div class="card"><h2>Event Log</h2><div class="log" id="log">Waiting…</div></div>
 <script>
 async function loadStatus(){
-  try{
-    const r = await fetch('/ayush8481/status');
-    const d = await r.json();
-    document.getElementById('s-total').textContent = d.stats.totalAdded;
-    document.getElementById('s-active').textContent = d.stats.active;
-    document.getElementById('s-normal').textContent = d.stats.normalCount;
-    document.getElementById('s-special').textContent = d.stats.specialCount;
-    document.getElementById('s-processing').textContent = d.stats.processing;
-    document.getElementById('s-failed').textContent = d.stats.failed;
-    document.getElementById('s-succeeded').textContent = d.stats.succeeded;
-    document.getElementById('s-workers').textContent = d.workerActive + '/' + d.workerMax;
+try{
+const r=await fetch('/ayush8481/status');
+const d=await r.json();
+document.getElementById('s-total').textContent=d.stats.totalAdded;
+document.getElementById('s-active').textContent=d.stats.active;
+document.getElementById('s-failed').textContent=d.stats.failed;
+document.getElementById('s-groups').textContent=d.stats.groupCount;
+document.getElementById('s-refreshes').textContent=d.stats.refreshCount;
+document.getElementById('s-workers').textContent=d.workerActive+'/'+d.workerMax;
 
-    const total = d.stats.totalAdded || 1;
-    const done = d.stats.active + d.stats.failed;
-    document.getElementById('progressBar').style.width = Math.min(100, Math.round(done/total*100)) + '%';
-
-    const tbody = document.getElementById('channels');
-    tbody.innerHTML = '';
-    for(const c of d.channels.slice(0, 300)){
-      const tr = document.createElement('tr');
-      const expTxt = c.expires ? Math.max(0, Math.round((c.expires - Date.now()/1000)/60)) + ' min' : '—';
-      let cls = '';
-      if(c.status === 'active') cls = 'green';
-      else if(c.status === 'error' || c.status === 'failed') cls = 'red';
-      else cls = 'yellow';
-      const typeTxt = c.isSpecial ? '<span class="purple">special</span>' : 'normal';
-      tr.innerHTML = '<td>'+c.channelId+'</td><td>'+(c.name||'')+'</td><td>'+typeTxt+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td><td>'+(c.lastUpdated||'')+'</td><td style="color:#f87171">'+(c.error||'')+'</td>';
-      tbody.appendChild(tr);
-    }
-
-    const logEl = document.getElementById('log');
-    logEl.innerHTML = d.log.slice(-80).map(e => {
-      const cls = e.level === 'error' ? 'err' : e.level === 'warn' ? 'warn' : '';
-      return '<div class="'+cls+'">'+e.time+'  '+e.msg+'</div>';
-    }).join('') || 'No events yet.';
-    logEl.scrollTop = logEl.scrollHeight;
-  } catch(e){ console.error(e); }
+const gt=document.getElementById('groups');
+gt.innerHTML='';
+for(const g of d.groups){
+const tr=document.createElement('tr');
+const next=g.nextRefreshAt?new Date(g.nextRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
+tr.innerHTML='<td>'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+(g.lastRefreshAt?new Date(g.lastRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—')+'</td><td>'+next+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
+gt.appendChild(tr);
 }
 
+const tbody=document.getElementById('channels');
+tbody.innerHTML='';
+for(const c of d.channels.slice(0,300)){
+const tr=document.createElement('tr');
+const expTxt=c.expires?Math.max(0,Math.round((c.expires-Date.now()/1000)/60))+' min':'—';
+let cls=c.status==='active'?'green':(c.status==='error'||c.status==='failed')?'red':'yellow';
+tr.innerHTML='<td>'+c.channelId+'</td><td>'+(c.name||'')+'</td><td style="font-size:10px">'+(c.groupId||'')+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td><td>'+(c.lastUpdated||'')+'</td>';
+tbody.appendChild(tr);
+}
+const logEl=document.getElementById('log');
+logEl.innerHTML=d.log.slice(-80).map(e=>'<div class="'+(e.level==='error'?'err':e.level==='warn'?'warn':'')+'">'+e.time+'  '+e.msg+'</div>').join('');
+logEl.scrollTop=logEl.scrollHeight;
+}catch(e){}
+}
 async function processInput(){
-  const btn = document.getElementById('processBtn');
-  const text = document.getElementById('input').value.trim();
-  if(!text) return alert('Paste some channels first.');
-  btn.disabled = true; btn.textContent = 'Adding…';
-  try{
-    const r = await fetch('/ayush8481/add', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ input: text })
-    });
-    const d = await r.json();
-    if(d.error) throw new Error(d.error);
-    document.getElementById('input').value = '';
-    alert('✅ Added ' + d.added + ' (' + d.normal + ' normal, ' + d.special + ' special)');
-  } catch(e){ alert('❌ ' + e.message); }
-  btn.disabled = false; btn.textContent = '▶ Add to Queue';
-  loadStatus();
-}
-
-async function refreshAll(){
-  if(!confirm('Re-process ALL channels in the store?')) return;
-  const r = await fetch('/ayush8481/refresh-all', {method:'POST'});
-  const d = await r.json();
-  alert(d.message || 'Done');
-  loadStatus();
-}
-
-async function clearAll(){
-  if(!confirm('Clear all channels?')) return;
-  await fetch('/ayush8481/clear', {method:'POST'});
-  loadStatus();
-}
-
+const btn=document.getElementById('processBtn');
+const text=document.getElementById('input').value.trim();
+if(!text)return alert('Paste channels first.');
+btn.disabled=true;btn.textContent='Adding…';
+try{
+const r=await fetch('/ayush8481/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:text})});
+const d=await r.json();
+if(d.error)throw new Error(d.error);
+document.getElementById('input').value='';
+alert('✅ Added '+d.added);
+}catch(e){alert('❌ '+e.message);}
+btn.disabled=false;btn.textContent='▶ Add to Queue';
 loadStatus();
-setInterval(loadStatus, 3000);
-</script>
-</body></html>`);
+}
+async function refreshAll(){
+if(!confirm('Force refresh ALL groups now?'))return;
+const r=await fetch('/ayush8481/refresh-all',{method:'POST'});
+const d=await r.json();
+alert(d.message||'Done');
+loadStatus();
+}
+async function clearAll(){
+if(!confirm('Clear all?'))return;
+await fetch('/ayush8481/clear',{method:'POST'});
+loadStatus();
+}
+loadStatus();setInterval(loadStatus,5000);
+</script></body></html>`);
 });
 
-// ---- Add channels ----
 app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
     try {
         const text = req.body.input || '';
         const channels = parseChannelInput(text);
-        if (channels.length === 0) {
-            return res.status(400).json({ error: 'No valid channels found. Expected JSON array [{"Id":"...","url":"..."}]' });
-        }
-
-        let normalAdded = 0, specialAdded = 0;
+        if (channels.length === 0) return res.status(400).json({ error: 'No valid channels.' });
 
         for (const ch of channels) {
-            const special = isSpecialChannel(ch.url);
             const existing = channelStore.get(ch.channelId);
             if (!existing) {
                 channelStore.set(ch.channelId, {
@@ -724,26 +597,24 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
                     expires: 0,
                     lastUpdated: '',
                     status: 'queued',
-                    isSpecial: special,
+                    isSpecial: isSpecialChannel(ch.url),
                 });
                 stats.totalAdded++;
-                if (special) stats.specialCount++;
-                else stats.normalCount++;
             } else {
                 channelStore.set(ch.channelId, {
                     ...existing,
                     name: ch.name,
                     originalUrl: ch.url,
-                    isSpecial: special,
+                    isSpecial: isSpecialChannel(ch.url),
                     status: existing.status === 'active' ? 'active' : 'queued',
                 });
             }
-            if (special) specialAdded++; else normalAdded++;
         }
 
+        // Run the staggered group upload in background
         processAllChannels(channels).catch(e => log(`Global crash: ${e.message}`, 'error'));
 
-        res.json({ success: true, added: channels.length, normal: normalAdded, special: specialAdded });
+        res.json({ success: true, added: channels.length });
     } catch (err) {
         log(`Add failed: ${err.message}`, 'error');
         res.status(500).json({ error: err.message });
@@ -753,31 +624,40 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
 app.get('/ayush8481/status', (req, res) => {
     const all = [...channelStore.values()];
     const active = all.filter(c => c.status === 'active').length;
-    const processing = all.filter(c => c.status === 'processing').length;
-
+    const groupArr = [...groups.values()].map(g => ({
+        groupId: g.groupId,
+        channelIds: g.channelIds,
+        lastRefreshAt: g.lastRefreshAt,
+        nextRefreshAt: g.nextRefreshAt,
+        processing: g.processing,
+    }));
     res.json({
-        stats: { ...stats, active, processing },
+        stats: { ...stats, active, groupCount: groups.size },
         workerActive: apifyLimit.activeCount,
         workerMax: MAX_CONCURRENT_RUNS,
+        groups: groupArr,
         channels: all,
         log: eventLog.slice(-100),
     });
 });
 
-app.post('/ayush8481/refresh-all', (req, res) => {
-    const active = [...channelStore.values()].filter(c => c.status === 'active' || c.status === 'error');
-    if (active.length === 0) return res.json({ message: 'No active channels.' });
-    const channels = active.map(c => ({ channelId: c.channelId, name: c.name, url: c.originalUrl }));
-    processAllChannels(channels).catch(e => log(`Global crash: ${e.message}`, 'error'));
-    res.json({ message: `Refreshing ${active.length} channels.` });
+app.post('/ayush8481/refresh-all', async (req, res) => {
+    if (groups.size === 0) return res.json({ message: 'No groups yet.' });
+    res.json({ message: `Forcing refresh on ${groups.size} groups` });
+    for (const g of groups.values()) {
+        if (!g.processing) {
+            processGroup(g.groupId).catch(e => log(`Group ${g.groupId} failed: ${e.message}`, 'error'));
+        }
+    }
 });
 
 app.post('/ayush8481/clear', (req, res) => {
+    for (const g of groups.values()) {
+        if (g.timer) clearTimeout(g.timer);
+    }
+    groups.clear();
     channelStore.clear();
     stats.totalAdded = 0;
-    stats.normalCount = 0;
-    stats.specialCount = 0;
-    stats.queued = 0;
     stats.succeeded = 0;
     stats.failed = 0;
     stats.refreshCount = 0;
@@ -797,14 +677,23 @@ app.get('/jiostb.json', (req, res) => {
     res.json(result);
 });
 
+app.get('/debug/groups', (req, res) => {
+    const now = Math.floor(Date.now() / 1000);
+    res.json([...groups.values()].map(g => ({
+        groupId: g.groupId,
+        channelCount: g.channelIds.length,
+        lastRefreshAt: g.lastRefreshAt,
+        nextRefreshAt: g.nextRefreshAt,
+        secondsUntilRefresh: g.nextRefreshAt ? g.nextRefreshAt - now : null,
+        processing: g.processing,
+    })));
+});
+
 app.get('/debug/state', (req, res) => {
     res.json({
-        stats,
+        stats: { ...stats, groupCount: groups.size },
         workerActive: apifyLimit.activeCount,
-        workerPending: apifyLimit.pendingCount,
         workerMax: MAX_CONCURRENT_RUNS,
-        batchMemoryMB: BATCH_MEMORY_MB,
-        singleMemoryMB: SINGLE_MEMORY_MB,
         nodeVersion: process.version,
         hasApifyToken: !!APIFY_TOKEN,
         channelCount: channelStore.size,
@@ -817,8 +706,6 @@ app.get('/debug/state', (req, res) => {
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
     log(`Server started on port ${PORT}`);
-    log(`Normal: batch ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Special: 1 URL @ ${SINGLE_MEMORY_MB} MB`);
-    log(`Concurrency: ${MAX_CONCURRENT_RUNS} (Free plan limit is 5)`);
-    console.log(`   Admin:   /ayush8481/admin`);
-    console.log(`   Public:  /jiostb.json`);
+    log(`Batch: ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Workers: ${MAX_CONCURRENT_RUNS}`);
+    log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
 });
