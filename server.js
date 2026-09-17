@@ -15,22 +15,22 @@ if (!APIFY_TOKEN) {
 // ---------------------------------------------------------------------------
 const APIFY_ACTOR = 'apify~cheerio-scraper';
 const APIFY_BASE = 'https://api.apify.com/v2';
-const BATCH_SIZE = 50;                        // URLs per Apify run
-const BATCH_MEMORY_MB = 2048;                 // 2 GB per run
-const MAX_CONCURRENT_RUNS = 4;                // 4 × 2 GB = 8 GB total
+const BATCH_SIZE = 50;
+const BATCH_MEMORY_MB = 2048;
+const MAX_CONCURRENT_RUNS = 4;
 
-const GROUP_SIZE = 200;                       // channels per refresh group
-const GROUP_STAGGER_MS = 5 * 60 * 1000;       // 5 min between initial upload groups
-const GROUP_REFRESH_INTERVAL_S = 5 * 3600;    // refresh each group every 5 hours
-const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;  // 30 min retry on failure
+const GROUP_SIZE = 200;
+const GROUP_STAGGER_MS = 5 * 60 * 1000;
+const GROUP_REFRESH_INTERVAL_S = 5 * 3600;
+const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
 // ---------------------------------------------------------------------------
 //  STORAGE
 // ---------------------------------------------------------------------------
-const channelStore = new Map();   // channelId -> channel object
-const groups = new Map();         // groupId -> group object
+const channelStore = new Map();
+const groups = new Map();
 
 const stats = {
     totalAdded: 0,
@@ -72,15 +72,8 @@ function chunkArray(arr, size) {
 }
 
 // ---------------------------------------------------------------------------
-//  URL / COOKIE SANITIZATION (fixes double __hdnea__= prefix)
+//  URL / COOKIE SANITIZATION
 // ---------------------------------------------------------------------------
-
-/**
- * Strips any accidental __hdnea__= or hdnea= prefix from a cookie value.
- *   "hdnea=st=...~hmac=...; Domain=..."     → "st=...~hmac=..."
- *   "__hdnea__=st=...~hmac=...; Domain=..." → "st=...~hmac=..."
- *   "st=...~hmac=...; Domain=..."           → "st=...~hmac=..."
- */
 function cleanCookieValue(cookieStr) {
     let s = cookieStr.split(';')[0].trim();
     while (s.startsWith('__hdnea__=')) s = s.substring('__hdnea__='.length);
@@ -88,9 +81,6 @@ function cleanCookieValue(cookieStr) {
     return s;
 }
 
-/**
- * Rebuilds a URL with exactly one "__hdnea__=" prefix.
- */
 function buildUrlWithCookie(baseUrl, cookieValue) {
     const idx = baseUrl.indexOf('__hdnea__=');
     let base;
@@ -102,9 +92,6 @@ function buildUrlWithCookie(baseUrl, cookieValue) {
     return base + '__hdnea__=' + cookieValue;
 }
 
-/**
- * Sanitizes a URL — guarantees exactly one "__hdnea__=" prefix.
- */
 function sanitizeUrl(url) {
     if (!url) return url;
     const idx = url.indexOf('__hdnea__=');
@@ -117,7 +104,7 @@ function sanitizeUrl(url) {
 }
 
 // ---------------------------------------------------------------------------
-//  ACL EXTRACTION
+//  ACL
 // ---------------------------------------------------------------------------
 function extractAclFromUrl(url) {
     const m = url.match(/~acl=([^~]+)~/);
@@ -222,7 +209,6 @@ async function runApify(urls) {
 //  BATCH PROCESSOR
 // ---------------------------------------------------------------------------
 async function processBatchOfChannels(channels, label) {
-    // Sanitize every input URL before sending to Apify
     const urls = channels.map(c => sanitizeUrl(c.url));
     log(`▶️  [${label}] starting ${urls.length} urls`);
 
@@ -235,7 +221,19 @@ async function processBatchOfChannels(channels, label) {
     if (!Array.isArray(results)) throw new Error('Apify returned non-array');
     log(`◀️  [${label}] got ${results.length} results`);
 
-    // Build ACL -> cookie map from Apify results
+    // ---- Diagnostics: how many had Set-Cookie? ----
+    let setCookieCount = 0;
+    let statusHistogram = {};
+    for (const item of results) {
+        const headers = item.headers || {};
+        const setCookie = headers['set-cookie'] || headers['Set-Cookie'];
+        if (setCookie) setCookieCount++;
+        const st = item.status ?? 0;
+        statusHistogram[st] = (statusHistogram[st] || 0) + 1;
+    }
+    log(`   [${label}] set-cookie: ${setCookieCount}/${results.length}, statuses: ${JSON.stringify(statusHistogram)}`);
+
+    // Build ACL -> cookie map
     const aclToCookie = new Map();
     for (const item of results) {
         const headers = item.headers || {};
@@ -243,7 +241,6 @@ async function processBatchOfChannels(channels, label) {
         if (!setCookie) continue;
         const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
 
-        // ✅ Clean the cookie value (strips __hdnea__= or hdnea= prefix)
         const cookieValue = cleanCookieValue(cookieStr);
         if (!cookieValue || !cookieValue.startsWith('st=')) continue;
 
@@ -278,34 +275,35 @@ async function processBatchOfChannels(channels, label) {
             hit = aclToCookie.values().next().value;
         }
 
+        const current = channelStore.get(ch.channelId) || {};
+
         if (!hit) {
             failed++;
             channelStore.set(ch.channelId, {
-                ...(channelStore.get(ch.channelId) || {}),
+                ...current,
                 channelId: ch.channelId, name: ch.name,
-                originalUrl: ch.url,
-                currentUrl: sanitizeUrl(ch.url),
-                cookie: '', expires: 0,
+                // ✅ Keep existing originalUrl/currentUrl — do not overwrite with the failed attempt
+                originalUrl: current.originalUrl || ch.url,
+                currentUrl: current.currentUrl || sanitizeUrl(ch.url),
+                cookie: current.cookie || '',
+                expires: current.expires || 0,
                 lastUpdated: getFormattedDate(),
-                status: 'no_cookie', error: 'No cookie for ACL',
+                status: 'no_cookie',
+                error: 'No Set-Cookie for ACL',
             });
             continue;
         }
 
         aclToCookie.delete(aclUrl);
 
-        if (hit.exp <= 0) {
-            failed++;
-            continue;
-        }
+        if (hit.exp <= 0) { failed++; continue; }
 
-        // ✅ Build URL with guaranteed single __hdnea__= prefix
-        const newUrl = buildUrlWithCookie(ch.url, hit.cookieValue);
+        const newUrl = buildUrlWithCookie(current.originalUrl || ch.url, hit.cookieValue);
 
         channelStore.set(ch.channelId, {
-            ...(channelStore.get(ch.channelId) || {}),
+            ...current,
             channelId: ch.channelId, name: ch.name,
-            originalUrl: ch.url,
+            originalUrl: current.originalUrl || ch.url,
             currentUrl: newUrl,
             cookie: 'hdnea=' + hit.cookieValue,
             expires: hit.exp,
@@ -362,10 +360,10 @@ async function processGroup(groupId) {
     try {
         const activeChannels = g.channelIds
             .map(id => channelStore.get(id))
-            .filter(c => c && (c.status === 'active' || c.status === 'error'));
+            .filter(c => c && (c.status === 'active' || c.status === 'error' || c.status === 'no_cookie'));
 
         if (activeChannels.length === 0) {
-            log(`⚠️ [${groupId}] no active channels, rescheduling`);
+            log(`⚠️ [${groupId}] no channels to refresh, rescheduling`);
             g.processing = false;
             scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
             return;
@@ -373,11 +371,20 @@ async function processGroup(groupId) {
 
         log(`🔄 [${groupId}] refreshing ${activeChannels.length} channels`);
 
-        const inputs = activeChannels.map(c => ({
-            channelId: c.channelId,
-            name: c.name,
-            url: sanitizeUrl(c.originalUrl),
-        }));
+        // ✅ THE FIX: Use currentUrl (latest cookie), NOT originalUrl (old cookie)
+        const inputs = activeChannels.map(c => {
+            const chosen = sanitizeUrl(c.currentUrl || c.originalUrl);
+            return {
+                channelId: c.channelId,
+                name: c.name,
+                url: chosen,
+            };
+        });
+
+        // Sanity-check: log a sample
+        if (inputs[0]) {
+            log(`   [${groupId}] sample url: ${inputs[0].url.slice(0, 120)}…`);
+        }
 
         const batches = chunkArray(inputs, BATCH_SIZE);
         let idx = 0;
@@ -391,9 +398,10 @@ async function processGroup(groupId) {
                     log(`❌ [${label}] ${err.message}`, 'error');
                     for (const ch of batch) {
                         const cur = channelStore.get(ch.channelId) || {};
+                        // Keep prior cookie/url — do not wipe
                         channelStore.set(ch.channelId, {
                             ...cur,
-                            status: 'error',
+                            status: cur.status === 'active' ? 'error' : cur.status,
                             error: err.message,
                         });
                     }
@@ -414,10 +422,9 @@ async function processGroup(groupId) {
 }
 
 // ---------------------------------------------------------------------------
-//  INITIAL PROCESSING — grouped with stagger
+//  INITIAL PROCESSING
 // ---------------------------------------------------------------------------
 async function processAllChannels(channels) {
-    // Sanitize all inputs upfront
     const cleanChannels = channels.map(ch => ({ ...ch, url: sanitizeUrl(ch.url) }));
 
     const channelGroups = chunkArray(cleanChannels, GROUP_SIZE);
@@ -448,7 +455,8 @@ async function processAllChannels(channels) {
                         const cur = channelStore.get(ch.channelId) || {};
                         channelStore.set(ch.channelId, {
                             ...cur, channelId: ch.channelId, name: ch.name,
-                            originalUrl: ch.url, currentUrl: cur.currentUrl || sanitizeUrl(ch.url),
+                            originalUrl: cur.originalUrl || ch.url,
+                            currentUrl: cur.currentUrl || sanitizeUrl(ch.url),
                             status: 'error', error: err.message,
                         });
                         stats.failed++;
@@ -504,21 +512,6 @@ function parseChannelInput(text) {
         channels.push({ channelId: String(id), name: nonUrl[1] || id, url: sanitizeUrl(url) });
     }
     return channels;
-}
-
-// ---------------------------------------------------------------------------
-//  STARTUP SANITIZATION — heals any corrupted entries on boot
-// ---------------------------------------------------------------------------
-function sanitizeStoreOnBoot() {
-    let fixed = 0;
-    for (const [id, c] of channelStore.entries()) {
-        const cleaned = sanitizeUrl(c.currentUrl || c.originalUrl);
-        if (cleaned !== c.currentUrl) {
-            channelStore.set(id, { ...c, currentUrl: cleaned, originalUrl: sanitizeUrl(c.originalUrl) });
-            fixed++;
-        }
-    }
-    if (fixed > 0) log(`🧹 Startup: sanitized ${fixed} corrupted URLs`);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +600,7 @@ tbody.innerHTML='';
 for(const c of d.channels.slice(0,300)){
 const tr=document.createElement('tr');
 const expTxt=c.expires?Math.max(0,Math.round((c.expires-Date.now()/1000)/60))+' min':'—';
-let cls=c.status==='active'?'green':(c.status==='error'||c.status==='failed')?'red':'yellow';
+let cls=c.status==='active'?'green':(c.status==='error'||c.status==='failed'||c.status==='no_cookie')?'red':'yellow';
 tr.innerHTML='<td>'+c.channelId+'</td><td>'+(c.name||'')+'</td><td style="font-size:10px">'+(c.groupId||'')+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td><td>'+(c.lastUpdated||'')+'</td>';
 tbody.appendChild(tr);
 }
@@ -672,7 +665,9 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
                 channelStore.set(ch.channelId, {
                     ...existing,
                     name: ch.name,
+                    // Update both URLs when user re-uploads
                     originalUrl: ch.url,
+                    currentUrl: ch.url,
                     isSpecial: isSpecialChannel(ch.url),
                     status: existing.status === 'active' ? 'active' : 'queued',
                 });
@@ -759,6 +754,24 @@ app.get('/debug/groups', (req, res) => {
     })));
 });
 
+app.get('/debug/channel/:id', (req, res) => {
+    const c = channelStore.get(req.params.id);
+    if (!c) return res.status(404).json({ error: 'not found' });
+    res.json({
+        channelId: c.channelId,
+        name: c.name,
+        groupId: c.groupId,
+        status: c.status,
+        error: c.error,
+        expires: c.expires,
+        expiresInMinutes: c.expires ? Math.round((c.expires - Date.now() / 1000) / 60) : null,
+        originalUrl: c.originalUrl,
+        currentUrl: c.currentUrl,
+        cookie: c.cookie,
+        lastUpdated: c.lastUpdated,
+    });
+});
+
 app.get('/debug/corrupted', (req, res) => {
     const bad = [];
     for (const c of channelStore.values()) {
@@ -785,7 +798,6 @@ app.get('/debug/state', (req, res) => {
 //  START
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
-    sanitizeStoreOnBoot();
     log(`Server started on port ${PORT}`);
     log(`Batch: ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Workers: ${MAX_CONCURRENT_RUNS}`);
     log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
