@@ -3,10 +3,20 @@ const pLimit = require('p-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
-if (!APIFY_TOKEN) {
-    console.error('❌ APIFY_TOKEN environment variable is required.');
+// ---------------------------------------------------------------------------
+//  TOKEN ROTATION — reads on every call, IST-based day of month
+// ---------------------------------------------------------------------------
+function getApifyToken() {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const day = now.getDate();
+    if (day <= 10) return process.env.APIFY_TOKEN1 || process.env.APIFY_TOKEN;
+    if (day <= 20) return process.env.APIFY_TOKEN2 || process.env.APIFY_TOKEN;
+    return process.env.APIFY_TOKEN3 || process.env.APIFY_TOKEN;
+}
+
+if (!process.env.APIFY_TOKEN1 && !process.env.APIFY_TOKEN && !process.env.APIFY_TOKEN2 && !process.env.APIFY_TOKEN3) {
+    console.error('❌ No APIFY_TOKEN* env variable is set.');
     process.exit(1);
 }
 
@@ -22,7 +32,8 @@ const MAX_CONCURRENT_RUNS = 4;
 const GROUP_SIZE = 200;
 const GROUP_STAGGER_MS = 5 * 60 * 1000;
 const GROUP_REFRESH_INTERVAL_S = 5 * 3600;
-const GROUP_RETRY_DELAY_MS = 30 * 60 * 1000;
+const GROUP_RETRY_DELAY_MS = 10 * 60 * 1000;      // 10 min retry
+const FAILURE_THRESHOLD = 0.05;                   // 5%
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
@@ -37,6 +48,7 @@ const stats = {
     succeeded: 0,
     failed: 0,
     refreshCount: 0,
+    retryCount: 0,
     startedAt: null,
     lastEventAt: null,
 };
@@ -139,6 +151,7 @@ function isSpecialChannel(url) {
 //  APIFY
 // ---------------------------------------------------------------------------
 async function startApifyRun(urls) {
+    const token = getApifyToken();
     const startUrls = urls.map(u => ({ url: u, method: 'HEAD' }));
     const apifyInput = {
         startUrls,
@@ -159,7 +172,7 @@ async function startApifyRun(urls) {
             };
         }`,
     };
-    const apiUrl = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${APIFY_TOKEN}&memory=${BATCH_MEMORY_MB}`;
+    const apiUrl = `${APIFY_BASE}/acts/${APIFY_ACTOR}/runs?token=${token}&memory=${BATCH_MEMORY_MB}`;
     const res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -170,7 +183,8 @@ async function startApifyRun(urls) {
 }
 
 async function waitForRun(runId) {
-    const url = `${APIFY_BASE}/actor-runs/${runId}?token=${APIFY_TOKEN}`;
+    const token = getApifyToken();
+    const url = `${APIFY_BASE}/actor-runs/${runId}?token=${token}`;
     while (true) {
         await sleep(3000);
         const res = await fetch(url);
@@ -182,7 +196,8 @@ async function waitForRun(runId) {
 }
 
 async function fetchDatasetItems(datasetId) {
-    const url = `${APIFY_BASE}/datasets/${datasetId}/items?token=${APIFY_TOKEN}&clean=true`;
+    const token = getApifyToken();
+    const url = `${APIFY_BASE}/datasets/${datasetId}/items?token=${token}&clean=true`;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`Dataset fetch failed (${res.status})`);
     return res.json();
@@ -190,7 +205,10 @@ async function fetchDatasetItems(datasetId) {
 
 async function deleteDataset(datasetId) {
     if (!datasetId) return;
-    try { await fetch(`${APIFY_BASE}/datasets/${datasetId}?token=${APIFY_TOKEN}`, { method: 'DELETE' }); } catch (_) {}
+    try {
+        const token = getApifyToken();
+        await fetch(`${APIFY_BASE}/datasets/${datasetId}?token=${token}`, { method: 'DELETE' });
+    } catch (_) {}
 }
 
 async function runApify(urls) {
@@ -206,24 +224,24 @@ async function runApify(urls) {
 }
 
 // ---------------------------------------------------------------------------
-//  BATCH PROCESSOR
+//  BATCH PROCESSOR — returns { matched, failed, failedIds }
 // ---------------------------------------------------------------------------
 async function processBatchOfChannels(channels, label) {
     const urls = channels.map(c => sanitizeUrl(c.url));
     log(`▶️  [${label}] starting ${urls.length} urls`);
 
+    // Do NOT change status here — keep serving old URL during refresh
     for (const ch of channels) {
         const existing = channelStore.get(ch.channelId) || {};
-        channelStore.set(ch.channelId, { ...existing, status: 'processing' });
+        channelStore.set(ch.channelId, { ...existing, refreshing: true });
     }
 
     const results = await runApify(urls);
     if (!Array.isArray(results)) throw new Error('Apify returned non-array');
     log(`◀️  [${label}] got ${results.length} results`);
 
-    // ---- Diagnostics: how many had Set-Cookie? ----
     let setCookieCount = 0;
-    let statusHistogram = {};
+    const statusHistogram = {};
     for (const item of results) {
         const headers = item.headers || {};
         const setCookie = headers['set-cookie'] || headers['Set-Cookie'];
@@ -233,22 +251,18 @@ async function processBatchOfChannels(channels, label) {
     }
     log(`   [${label}] set-cookie: ${setCookieCount}/${results.length}, statuses: ${JSON.stringify(statusHistogram)}`);
 
-    // Build ACL -> cookie map
     const aclToCookie = new Map();
     for (const item of results) {
         const headers = item.headers || {};
         let setCookie = headers['set-cookie'] || headers['Set-Cookie'];
         if (!setCookie) continue;
         const cookieStr = Array.isArray(setCookie) ? setCookie[0] : setCookie;
-
         const cookieValue = cleanCookieValue(cookieStr);
         if (!cookieValue || !cookieValue.startsWith('st=')) continue;
-
         const aclRaw = extractAclFromCookie(cookieStr);
         if (!aclRaw) continue;
         const acl = normaliseAcl(aclRaw);
         const exp = extractExpiry(cookieValue);
-
         const existing = aclToCookie.get(acl);
         if (!existing || exp > existing.exp) {
             aclToCookie.set(acl, { cookieValue, exp });
@@ -257,6 +271,7 @@ async function processBatchOfChannels(channels, label) {
     log(`   [${label}] ACL map: ${aclToCookie.size} unique`);
 
     let matched = 0, failed = 0;
+    const failedIds = [];
 
     for (const ch of channels) {
         const aclUrl = normaliseAcl(extractAclFromUrl(ch.url));
@@ -276,27 +291,36 @@ async function processBatchOfChannels(channels, label) {
         }
 
         const current = channelStore.get(ch.channelId) || {};
+        const now = Math.floor(Date.now() / 1000);
 
         if (!hit) {
             failed++;
+            failedIds.push(ch.channelId);
+
+            // Keep existing URL/cookie if we had one; only mark status if expired
+            const stillValid = current.expires && current.expires > now + 60;
             channelStore.set(ch.channelId, {
                 ...current,
-                channelId: ch.channelId, name: ch.name,
-                // ✅ Keep existing originalUrl/currentUrl — do not overwrite with the failed attempt
+                channelId: ch.channelId,
+                name: ch.name,
                 originalUrl: current.originalUrl || ch.url,
                 currentUrl: current.currentUrl || sanitizeUrl(ch.url),
                 cookie: current.cookie || '',
                 expires: current.expires || 0,
                 lastUpdated: getFormattedDate(),
-                status: 'no_cookie',
-                error: 'No Set-Cookie for ACL',
+                status: stillValid ? 'active' : (current.cookie ? 'error' : 'no_cookie'),
+                error: 'Refresh returned no Set-Cookie',
+                refreshing: false,
             });
             continue;
         }
 
         aclToCookie.delete(aclUrl);
-
-        if (hit.exp <= 0) { failed++; continue; }
+        if (hit.exp <= 0) {
+            failed++;
+            failedIds.push(ch.channelId);
+            continue;
+        }
 
         const newUrl = buildUrlWithCookie(current.originalUrl || ch.url, hit.cookieValue);
 
@@ -309,6 +333,7 @@ async function processBatchOfChannels(channels, label) {
             expires: hit.exp,
             lastUpdated: getFormattedDate(),
             status: 'active', error: null,
+            refreshing: false,
         });
         stats.succeeded++;
         matched++;
@@ -316,6 +341,7 @@ async function processBatchOfChannels(channels, label) {
 
     stats.failed += failed;
     log(`   [${label}] matched ${matched}, failed ${failed}, unused ${aclToCookie.size}`);
+    return { matched, failed, failedIds };
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +356,8 @@ function createGroup(channelIds) {
         nextRefreshAt: null,
         timer: null,
         processing: false,
+        retryAttempted: false,
+        lastFailedIds: [],
     });
     return groupId;
 }
@@ -358,20 +386,29 @@ async function processGroup(groupId) {
     g.processing = true;
 
     try {
-        const activeChannels = g.channelIds
+        let activeChannels = g.channelIds
             .map(id => channelStore.get(id))
-            .filter(c => c && (c.status === 'active' || c.status === 'error' || c.status === 'no_cookie'));
+            .filter(c => c && c.status !== 'queued');
+
+        // On retry, only process channels that failed last time
+        if (g.retryAttempted && g.lastFailedIds.length > 0) {
+            const failedSet = new Set(g.lastFailedIds);
+            activeChannels = activeChannels.filter(c => failedSet.has(c.channelId));
+            log(`🔁 [${groupId}] RETRY mode — only ${activeChannels.length} previously failed channels`);
+        }
 
         if (activeChannels.length === 0) {
             log(`⚠️ [${groupId}] no channels to refresh, rescheduling`);
             g.processing = false;
+            g.retryAttempted = false;
+            g.lastFailedIds = [];
             scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
             return;
         }
 
         log(`🔄 [${groupId}] refreshing ${activeChannels.length} channels`);
 
-        // ✅ THE FIX: Use currentUrl (latest cookie), NOT originalUrl (old cookie)
+        // ✅ Use currentUrl (fresh cookie), fall back to originalUrl only if currentUrl missing
         const inputs = activeChannels.map(c => {
             const chosen = sanitizeUrl(c.currentUrl || c.originalUrl);
             return {
@@ -381,43 +418,83 @@ async function processGroup(groupId) {
             };
         });
 
-        // Sanity-check: log a sample
         if (inputs[0]) {
             log(`   [${groupId}] sample url: ${inputs[0].url.slice(0, 120)}…`);
         }
 
         const batches = chunkArray(inputs, BATCH_SIZE);
         let idx = 0;
+        let totalMatched = 0;
+        let totalFailed = 0;
+        const allFailedIds = [];
+
         const tasks = batches.map(batch =>
             apifyLimit(async () => {
                 const label = `${groupId}-B${++idx}`;
                 try {
-                    await processBatchOfChannels(batch, label);
+                    const res = await processBatchOfChannels(batch, label);
+                    totalMatched += res.matched;
+                    totalFailed += res.failed;
+                    allFailedIds.push(...res.failedIds);
                     stats.refreshCount += batch.length;
                 } catch (err) {
                     log(`❌ [${label}] ${err.message}`, 'error');
+                    totalFailed += batch.length;
                     for (const ch of batch) {
                         const cur = channelStore.get(ch.channelId) || {};
-                        // Keep prior cookie/url — do not wipe
                         channelStore.set(ch.channelId, {
                             ...cur,
                             status: cur.status === 'active' ? 'error' : cur.status,
                             error: err.message,
+                            refreshing: false,
                         });
+                        allFailedIds.push(ch.channelId);
                     }
                 }
             })
         );
         await Promise.all(tasks);
 
-        g.lastRefreshAt = Math.floor(Date.now() / 1000);
-        g.processing = false;
+        const total = totalMatched + totalFailed;
+        const failRatio = total > 0 ? totalFailed / total : 0;
 
+        log(`📊 [${groupId}] refresh done: ${totalMatched} ok, ${totalFailed} failed (${(failRatio * 100).toFixed(1)}%)`);
+
+        g.lastRefreshAt = Math.floor(Date.now() / 1000);
+
+        // ---- Failure retry logic ----
+        if (failRatio > FAILURE_THRESHOLD && !g.retryAttempted) {
+            log(`⚠️ [${groupId}] ${(failRatio * 100).toFixed(1)}% > ${(FAILURE_THRESHOLD * 100)}% threshold — retrying ${allFailedIds.length} channels in ${GROUP_RETRY_DELAY_MS / 60000} min (1 retry only)`);
+            g.retryAttempted = true;
+            g.lastFailedIds = allFailedIds;
+            g.processing = false;
+            stats.retryCount++;
+            scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
+            return;
+        }
+
+        // Success path — reset retry state, schedule normal refresh
+        if (g.retryAttempted) {
+            log(`✅ [${groupId}] retry succeeded (${(failRatio * 100).toFixed(1)}% failed)`);
+        }
+        g.retryAttempted = false;
+        g.lastFailedIds = [];
+        g.processing = false;
         scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
     } catch (err) {
         log(`❌ [${groupId}] group refresh failed: ${err.message}`, 'error');
         g.processing = false;
-        scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
+        // Schedule retry but do NOT increment retryAttempted unless it was a fresh failure
+        if (!g.retryAttempted) {
+            g.retryAttempted = true;
+            g.lastFailedIds = [...g.channelIds];
+            stats.retryCount++;
+            scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
+        } else {
+            g.retryAttempted = false;
+            g.lastFailedIds = [];
+            scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+        }
     }
 }
 
@@ -458,6 +535,7 @@ async function processAllChannels(channels) {
                             originalUrl: cur.originalUrl || ch.url,
                             currentUrl: cur.currentUrl || sanitizeUrl(ch.url),
                             status: 'error', error: err.message,
+                            refreshing: false,
                         });
                         stats.failed++;
                     }
@@ -561,11 +639,12 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="s-failed">0</div></div>
 <div class="stat"><div class="stat-label">Groups</div><div class="stat-value" id="s-groups">0</div></div>
 <div class="stat"><div class="stat-label">Refreshes</div><div class="stat-value" id="s-refreshes">0</div></div>
+<div class="stat"><div class="stat-label">Retries</div><div class="stat-value yellow" id="s-retries">0</div></div>
 <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/4</div></div>
 </div>
 </div>
 <div class="card"><h2>Groups</h2>
-<table><thead><tr><th>Group</th><th>Channels</th><th>Last Refresh</th><th>Next Refresh</th><th>Status</th></tr></thead>
+<table><thead><tr><th>Group</th><th>Channels</th><th>Last Refresh</th><th>Next Refresh</th><th>Retry</th><th>Status</th></tr></thead>
 <tbody id="groups"></tbody></table>
 </div>
 <div class="card"><h2>Channels</h2>
@@ -583,6 +662,7 @@ document.getElementById('s-active').textContent=d.stats.active;
 document.getElementById('s-failed').textContent=d.stats.failed;
 document.getElementById('s-groups').textContent=d.stats.groupCount;
 document.getElementById('s-refreshes').textContent=d.stats.refreshCount;
+document.getElementById('s-retries').textContent=d.stats.retryCount;
 document.getElementById('s-workers').textContent=d.workerActive+'/'+d.workerMax;
 
 const gt=document.getElementById('groups');
@@ -591,7 +671,7 @@ for(const g of d.groups){
 const tr=document.createElement('tr');
 const next=g.nextRefreshAt?new Date(g.nextRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
 const last=g.lastRefreshAt?new Date(g.lastRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
-tr.innerHTML='<td style="font-size:10px">'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+last+'</td><td>'+next+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
+tr.innerHTML='<td style="font-size:10px">'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+last+'</td><td>'+next+'</td><td>'+(g.retryAttempted?'<span class="yellow">YES</span>':'no')+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
 gt.appendChild(tr);
 }
 
@@ -659,13 +739,13 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
                     lastUpdated: '',
                     status: 'queued',
                     isSpecial: isSpecialChannel(ch.url),
+                    refreshing: false,
                 });
                 stats.totalAdded++;
             } else {
                 channelStore.set(ch.channelId, {
                     ...existing,
                     name: ch.name,
-                    // Update both URLs when user re-uploads
                     originalUrl: ch.url,
                     currentUrl: ch.url,
                     isSpecial: isSpecialChannel(ch.url),
@@ -692,6 +772,7 @@ app.get('/ayush8481/status', (req, res) => {
         lastRefreshAt: g.lastRefreshAt,
         nextRefreshAt: g.nextRefreshAt,
         processing: g.processing,
+        retryAttempted: g.retryAttempted,
     }));
     res.json({
         stats: { ...stats, active, groupCount: groups.size },
@@ -708,6 +789,9 @@ app.post('/ayush8481/refresh-all', async (req, res) => {
     res.json({ message: `Forcing refresh on ${groups.size} groups` });
     for (const g of groups.values()) {
         if (!g.processing) {
+            // Reset retry state so a fresh manual refresh can retry if needed
+            g.retryAttempted = false;
+            g.lastFailedIds = [];
             processGroup(g.groupId).catch(e => log(`Group ${g.groupId} failed: ${e.message}`, 'error'));
         }
     }
@@ -723,18 +807,24 @@ app.post('/ayush8481/clear', (req, res) => {
     stats.succeeded = 0;
     stats.failed = 0;
     stats.refreshCount = 0;
+    stats.retryCount = 0;
     log('Store cleared.');
     res.json({ ok: true });
 });
 
+// ---------------------------------------------------------------------------
+//  jiostb.json — NEVER BLANKS during refresh
+//  Serves any channel that has ever had a valid cookie, regardless of status
+// ---------------------------------------------------------------------------
 app.get('/jiostb.json', (req, res) => {
     const result = [...channelStore.values()]
-        .filter(c => c.status === 'active')
+        .filter(c => c.currentUrl && c.currentUrl.includes('__hdnea__=') && c.expires > 0)
         .map(c => ({
             channel_id: c.channelId,
             url: sanitizeUrl(c.currentUrl),
             name: c.name,
             last_updated: c.lastUpdated,
+            expires: c.expires,
         }));
     res.json(result);
 });
@@ -751,7 +841,26 @@ app.get('/debug/groups', (req, res) => {
         nextRefreshAt: g.nextRefreshAt,
         secondsUntilRefresh: g.nextRefreshAt ? g.nextRefreshAt - now : null,
         processing: g.processing,
+        retryAttempted: g.retryAttempted,
+        lastFailedCount: g.lastFailedIds.length,
     })));
+});
+
+app.get('/debug/token', (req, res) => {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const day = now.getDate();
+    let active;
+    if (day <= 10) active = 'APIFY_TOKEN1';
+    else if (day <= 20) active = 'APIFY_TOKEN2';
+    else active = 'APIFY_TOKEN3';
+    const token = getApifyToken();
+    res.json({
+        istDay: day,
+        istDate: now.toISOString().slice(0, 10),
+        activeToken: active,
+        tokenPrefix: token ? token.slice(0, 14) + '…' : '(missing)',
+        fallbackUsed: !process.env[active],
+    });
 });
 
 app.get('/debug/channel/:id', (req, res) => {
@@ -768,6 +877,7 @@ app.get('/debug/channel/:id', (req, res) => {
         originalUrl: c.originalUrl,
         currentUrl: c.currentUrl,
         cookie: c.cookie,
+        refreshing: c.refreshing,
         lastUpdated: c.lastUpdated,
     });
 });
@@ -788,7 +898,6 @@ app.get('/debug/state', (req, res) => {
         workerActive: apifyLimit.activeCount,
         workerMax: MAX_CONCURRENT_RUNS,
         nodeVersion: process.version,
-        hasApifyToken: !!APIFY_TOKEN,
         channelCount: channelStore.size,
         log: eventLog.slice(-200),
     });
@@ -798,7 +907,12 @@ app.get('/debug/state', (req, res) => {
 //  START
 // ---------------------------------------------------------------------------
 app.listen(PORT, () => {
+    const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+    const day = now.getDate();
+    const activeToken = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
     log(`Server started on port ${PORT}`);
     log(`Batch: ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Workers: ${MAX_CONCURRENT_RUNS}`);
     log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
+    log(`IST day ${day} → using ${activeToken}`);
+    log(`Failure threshold: ${FAILURE_THRESHOLD * 100}% → 1 retry after ${GROUP_RETRY_DELAY_MS / 60000} min`);
 });
