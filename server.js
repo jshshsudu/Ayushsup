@@ -5,6 +5,44 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ---------------------------------------------------------------------------
+//  UPSTASH REDIS (persistence)
+// ---------------------------------------------------------------------------
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const REDIS_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
+const REDIS_KEY_CHANNELS = 'jio:channels';
+const REDIS_KEY_GROUPS = 'jio:groups';
+const REDIS_KEY_META = 'jio:meta';
+
+async function redisSet(key, value) {
+    if (!REDIS_ENABLED) return;
+    try {
+        await fetch(`${UPSTASH_URL}/set/${key}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+            body: typeof value === 'string' ? value : JSON.stringify(value),
+        });
+    } catch (e) {
+        console.log(`⚠️ Redis set failed: ${e.message}`);
+    }
+}
+
+async function redisGet(key) {
+    if (!REDIS_ENABLED) return null;
+    try {
+        const res = await fetch(`${UPSTASH_URL}/get/${key}`, {
+            headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+        });
+        const data = await res.json();
+        if (!data.result) return null;
+        try { return JSON.parse(data.result); } catch { return data.result; }
+    } catch (e) {
+        console.log(`⚠️ Redis get failed: ${e.message}`);
+        return null;
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  TOKEN ROTATION — reads on every call, IST-based day of month
 // ---------------------------------------------------------------------------
 function getApifyToken() {
@@ -32,8 +70,11 @@ const MAX_CONCURRENT_RUNS = 4;
 const GROUP_SIZE = 200;
 const GROUP_STAGGER_MS = 5 * 60 * 1000;
 const GROUP_REFRESH_INTERVAL_S = 5 * 3600;
-const GROUP_RETRY_DELAY_MS = 10 * 60 * 1000;      // 10 min retry
-const FAILURE_THRESHOLD = 0.05;                   // 5%
+const GROUP_RETRY_DELAY_MS = 10 * 60 * 1000;
+const FAILURE_THRESHOLD = 0.05;
+
+const PERSIST_DEBOUNCE_MS = 3000;      // debounce syncs to Redis
+const PERSIST_BACKSTOP_MS = 2 * 60 * 1000;  // periodic backup every 2 min
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
@@ -60,6 +101,107 @@ function log(msg, level = 'info') {
     if (eventLog.length > 500) eventLog.shift();
     const p = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
     console.log(`${p} ${msg}`);
+}
+
+// ---------------------------------------------------------------------------
+//  PERSISTENCE
+// ---------------------------------------------------------------------------
+let persistTimer = null;
+let persistRunning = false;
+
+function schedulePersist() {
+    if (!REDIS_ENABLED) return;
+    if (persistTimer) return;
+    persistTimer = setTimeout(async () => {
+        persistTimer = null;
+        await persistNow();
+    }, PERSIST_DEBOUNCE_MS);
+}
+
+async function persistNow() {
+    if (!REDIS_ENABLED || persistRunning) return;
+    persistRunning = true;
+    try {
+        const channels = [...channelStore.values()];
+        const groupsArr = [...groups.values()].map(g => ({
+            groupId: g.groupId,
+            channelIds: g.channelIds,
+            lastRefreshAt: g.lastRefreshAt,
+            nextRefreshAt: g.nextRefreshAt,
+            retryAttempted: g.retryAttempted,
+            lastFailedIds: g.lastFailedIds,
+        }));
+        const meta = { stats, savedAt: Math.floor(Date.now() / 1000) };
+
+        await Promise.all([
+            redisSet(REDIS_KEY_CHANNELS, channels),
+            redisSet(REDIS_KEY_GROUPS, groupsArr),
+            redisSet(REDIS_KEY_META, meta),
+        ]);
+    } catch (e) {
+        log(`Persist failed: ${e.message}`, 'warn');
+    } finally {
+        persistRunning = false;
+    }
+}
+
+async function restoreFromRedis() {
+    if (!REDIS_ENABLED) {
+        log('ℹ️ Redis not configured — persistence disabled');
+        return;
+    }
+    log('🔄 Restoring state from Redis…');
+
+    const [channels, groupsArr, meta] = await Promise.all([
+        redisGet(REDIS_KEY_CHANNELS),
+        redisGet(REDIS_KEY_GROUPS),
+        redisGet(REDIS_KEY_META),
+    ]);
+
+    if (Array.isArray(channels) && channels.length > 0) {
+        for (const c of channels) {
+            if (c && c.channelId) channelStore.set(c.channelId, c);
+        }
+        log(`✅ Restored ${channelStore.size} channels from Redis`);
+    } else {
+        log('ℹ️ No channels in Redis');
+    }
+
+    if (Array.isArray(groupsArr) && groupsArr.length > 0) {
+        for (const g of groupsArr) {
+            groups.set(g.groupId, {
+                groupId: g.groupId,
+                channelIds: g.channelIds || [],
+                lastRefreshAt: g.lastRefreshAt,
+                nextRefreshAt: g.nextRefreshAt,
+                timer: null,
+                processing: false,
+                retryAttempted: !!g.retryAttempted,
+                lastFailedIds: g.lastFailedIds || [],
+            });
+        }
+        log(`✅ Restored ${groups.size} groups`);
+
+        // Re-schedule each group's refresh based on its saved nextRefreshAt
+        const now = Math.floor(Date.now() / 1000);
+        for (const g of groups.values()) {
+            let delayMs;
+            if (g.nextRefreshAt && g.nextRefreshAt > now) {
+                delayMs = (g.nextRefreshAt - now) * 1000;
+            } else {
+                // Missed — schedule 30 s out to avoid stampede
+                delayMs = 30 * 1000;
+            }
+            scheduleGroupRefresh(g.groupId, delayMs);
+            log(`  ↻ [${g.groupId}] rescheduled in ${Math.round(delayMs / 1000)} s`);
+        }
+    } else {
+        log('ℹ️ No groups in Redis');
+    }
+
+    if (meta && meta.stats) {
+        Object.assign(stats, meta.stats);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,13 +366,12 @@ async function runApify(urls) {
 }
 
 // ---------------------------------------------------------------------------
-//  BATCH PROCESSOR — returns { matched, failed, failedIds }
+//  BATCH PROCESSOR
 // ---------------------------------------------------------------------------
 async function processBatchOfChannels(channels, label) {
     const urls = channels.map(c => sanitizeUrl(c.url));
     log(`▶️  [${label}] starting ${urls.length} urls`);
 
-    // Do NOT change status here — keep serving old URL during refresh
     for (const ch of channels) {
         const existing = channelStore.get(ch.channelId) || {};
         channelStore.set(ch.channelId, { ...existing, refreshing: true });
@@ -296,8 +437,6 @@ async function processBatchOfChannels(channels, label) {
         if (!hit) {
             failed++;
             failedIds.push(ch.channelId);
-
-            // Keep existing URL/cookie if we had one; only mark status if expired
             const stillValid = current.expires && current.expires > now + 60;
             channelStore.set(ch.channelId, {
                 ...current,
@@ -341,6 +480,7 @@ async function processBatchOfChannels(channels, label) {
 
     stats.failed += failed;
     log(`   [${label}] matched ${matched}, failed ${failed}, unused ${aclToCookie.size}`);
+    schedulePersist();
     return { matched, failed, failedIds };
 }
 
@@ -374,6 +514,7 @@ function scheduleGroupRefresh(groupId, delayMs) {
 
     const when = new Date(g.nextRefreshAt * 1000).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
     log(`⏰ [${groupId}] next refresh at ${when} IST`);
+    schedulePersist();
 }
 
 async function processGroup(groupId) {
@@ -390,7 +531,6 @@ async function processGroup(groupId) {
             .map(id => channelStore.get(id))
             .filter(c => c && c.status !== 'queued');
 
-        // On retry, only process channels that failed last time
         if (g.retryAttempted && g.lastFailedIds.length > 0) {
             const failedSet = new Set(g.lastFailedIds);
             activeChannels = activeChannels.filter(c => failedSet.has(c.channelId));
@@ -408,14 +548,9 @@ async function processGroup(groupId) {
 
         log(`🔄 [${groupId}] refreshing ${activeChannels.length} channels`);
 
-        // ✅ Use currentUrl (fresh cookie), fall back to originalUrl only if currentUrl missing
         const inputs = activeChannels.map(c => {
             const chosen = sanitizeUrl(c.currentUrl || c.originalUrl);
-            return {
-                channelId: c.channelId,
-                name: c.name,
-                url: chosen,
-            };
+            return { channelId: c.channelId, name: c.name, url: chosen };
         });
 
         if (inputs[0]) {
@@ -462,7 +597,6 @@ async function processGroup(groupId) {
 
         g.lastRefreshAt = Math.floor(Date.now() / 1000);
 
-        // ---- Failure retry logic ----
         if (failRatio > FAILURE_THRESHOLD && !g.retryAttempted) {
             log(`⚠️ [${groupId}] ${(failRatio * 100).toFixed(1)}% > ${(FAILURE_THRESHOLD * 100)}% threshold — retrying ${allFailedIds.length} channels in ${GROUP_RETRY_DELAY_MS / 60000} min (1 retry only)`);
             g.retryAttempted = true;
@@ -470,10 +604,10 @@ async function processGroup(groupId) {
             g.processing = false;
             stats.retryCount++;
             scheduleGroupRefresh(groupId, GROUP_RETRY_DELAY_MS);
+            schedulePersist();
             return;
         }
 
-        // Success path — reset retry state, schedule normal refresh
         if (g.retryAttempted) {
             log(`✅ [${groupId}] retry succeeded (${(failRatio * 100).toFixed(1)}% failed)`);
         }
@@ -481,10 +615,10 @@ async function processGroup(groupId) {
         g.lastFailedIds = [];
         g.processing = false;
         scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+        schedulePersist();
     } catch (err) {
         log(`❌ [${groupId}] group refresh failed: ${err.message}`, 'error');
         g.processing = false;
-        // Schedule retry but do NOT increment retryAttempted unless it was a fresh failure
         if (!g.retryAttempted) {
             g.retryAttempted = true;
             g.lastFailedIds = [...g.channelIds];
@@ -495,6 +629,7 @@ async function processGroup(groupId) {
             g.lastFailedIds = [];
             scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
         }
+        schedulePersist();
     }
 }
 
@@ -547,6 +682,7 @@ async function processAllChannels(channels) {
         const g = groups.get(groupId);
         g.lastRefreshAt = Math.floor(Date.now() / 1000);
         scheduleGroupRefresh(groupId, GROUP_REFRESH_INTERVAL_S * 1000);
+        schedulePersist();
 
         if (i < channelGroups.length - 1) {
             log(`⏳ Waiting ${GROUP_STAGGER_MS / 60000} min before group ${i + 2}…`);
@@ -557,6 +693,7 @@ async function processAllChannels(channels) {
     stats.lastEventAt = getFormattedDate();
     const active = [...channelStore.values()].filter(c => c.status === 'active').length;
     log(`🏁 [DONE] Active: ${active}, Failed: ${stats.failed}, Groups: ${groups.size}`);
+    schedulePersist();
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +768,7 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <button class="secondary" onclick="refreshAll()">🔄 Refresh All Groups</button>
 <button class="danger" onclick="clearAll()">🗑 Clear All</button>
 <a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
+<a href="/debug/state" target="_blank"><button class="secondary">🔍 Debug</button></a>
 </div>
 <div class="card"><h2>Status</h2>
 <div class="grid">
@@ -641,6 +779,7 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <div class="stat"><div class="stat-label">Refreshes</div><div class="stat-value" id="s-refreshes">0</div></div>
 <div class="stat"><div class="stat-label">Retries</div><div class="stat-value yellow" id="s-retries">0</div></div>
 <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/4</div></div>
+<div class="stat"><div class="stat-label">Redis</div><div class="stat-value" id="s-redis">—</div></div>
 </div>
 </div>
 <div class="card"><h2>Groups</h2>
@@ -664,6 +803,8 @@ document.getElementById('s-groups').textContent=d.stats.groupCount;
 document.getElementById('s-refreshes').textContent=d.stats.refreshCount;
 document.getElementById('s-retries').textContent=d.stats.retryCount;
 document.getElementById('s-workers').textContent=d.workerActive+'/'+d.workerMax;
+document.getElementById('s-redis').textContent=d.redisEnabled?(d.redisOk?'yes':'err'):'off';
+document.getElementById('s-redis').className='stat-value '+(d.redisEnabled?(d.redisOk?'green':'red'):'yellow');
 
 const gt=document.getElementById('groups');
 gt.innerHTML='';
@@ -712,7 +853,7 @@ alert(d.message||'Done');
 loadStatus();
 }
 async function clearAll(){
-if(!confirm('Clear all?'))return;
+if(!confirm('Clear ALL state (including Redis)?'))return;
 await fetch('/ayush8481/clear',{method:'POST'});
 loadStatus();
 }
@@ -720,7 +861,7 @@ loadStatus();setInterval(loadStatus,5000);
 </script></body></html>`);
 });
 
-app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
+app.post('/ayush8481/add', express.json({ limit: '10mb' }), async (req, res) => {
     try {
         const text = req.body.input || '';
         const channels = parseChannelInput(text);
@@ -730,13 +871,9 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
             const existing = channelStore.get(ch.channelId);
             if (!existing) {
                 channelStore.set(ch.channelId, {
-                    channelId: ch.channelId,
-                    name: ch.name,
-                    originalUrl: ch.url,
-                    currentUrl: ch.url,
-                    cookie: '',
-                    expires: 0,
-                    lastUpdated: '',
+                    channelId: ch.channelId, name: ch.name,
+                    originalUrl: ch.url, currentUrl: ch.url,
+                    cookie: '', expires: 0, lastUpdated: '',
                     status: 'queued',
                     isSpecial: isSpecialChannel(ch.url),
                     refreshing: false,
@@ -744,18 +881,16 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), (req, res) => {
                 stats.totalAdded++;
             } else {
                 channelStore.set(ch.channelId, {
-                    ...existing,
-                    name: ch.name,
-                    originalUrl: ch.url,
-                    currentUrl: ch.url,
+                    ...existing, name: ch.name,
+                    originalUrl: ch.url, currentUrl: ch.url,
                     isSpecial: isSpecialChannel(ch.url),
                     status: existing.status === 'active' ? 'active' : 'queued',
                 });
             }
         }
 
+        schedulePersist();
         processAllChannels(channels).catch(e => log(`Global crash: ${e.message}`, 'error'));
-
         res.json({ success: true, added: channels.length });
     } catch (err) {
         log(`Add failed: ${err.message}`, 'error');
@@ -781,6 +916,8 @@ app.get('/ayush8481/status', (req, res) => {
         groups: groupArr,
         channels: all,
         log: eventLog.slice(-100),
+        redisEnabled: REDIS_ENABLED,
+        redisOk: REDIS_ENABLED,
     });
 });
 
@@ -789,7 +926,6 @@ app.post('/ayush8481/refresh-all', async (req, res) => {
     res.json({ message: `Forcing refresh on ${groups.size} groups` });
     for (const g of groups.values()) {
         if (!g.processing) {
-            // Reset retry state so a fresh manual refresh can retry if needed
             g.retryAttempted = false;
             g.lastFailedIds = [];
             processGroup(g.groupId).catch(e => log(`Group ${g.groupId} failed: ${e.message}`, 'error'));
@@ -797,7 +933,7 @@ app.post('/ayush8481/refresh-all', async (req, res) => {
     }
 });
 
-app.post('/ayush8481/clear', (req, res) => {
+app.post('/ayush8481/clear', async (req, res) => {
     for (const g of groups.values()) {
         if (g.timer) clearTimeout(g.timer);
     }
@@ -808,14 +944,17 @@ app.post('/ayush8481/clear', (req, res) => {
     stats.failed = 0;
     stats.refreshCount = 0;
     stats.retryCount = 0;
-    log('Store cleared.');
+    if (REDIS_ENABLED) {
+        await Promise.all([
+            redisSet(REDIS_KEY_CHANNELS, []),
+            redisSet(REDIS_KEY_GROUPS, []),
+            redisSet(REDIS_KEY_META, { stats, savedAt: Math.floor(Date.now() / 1000) }),
+        ]);
+    }
+    log('Store cleared (including Redis).');
     res.json({ ok: true });
 });
 
-// ---------------------------------------------------------------------------
-//  jiostb.json — NEVER BLANKS during refresh
-//  Serves any channel that has ever had a valid cookie, regardless of status
-// ---------------------------------------------------------------------------
 app.get('/jiostb.json', (req, res) => {
     const result = [...channelStore.values()]
         .filter(c => c.currentUrl && c.currentUrl.includes('__hdnea__=') && c.expires > 0)
@@ -832,27 +971,21 @@ app.get('/jiostb.json', (req, res) => {
 // ---------------------------------------------------------------------------
 //  DIAGNOSTICS
 // ---------------------------------------------------------------------------
-app.get('/debug/groups', (req, res) => {
-    const now = Math.floor(Date.now() / 1000);
-    res.json([...groups.values()].map(g => ({
-        groupId: g.groupId,
-        channelCount: g.channelIds.length,
-        lastRefreshAt: g.lastRefreshAt,
-        nextRefreshAt: g.nextRefreshAt,
-        secondsUntilRefresh: g.nextRefreshAt ? g.nextRefreshAt - now : null,
-        processing: g.processing,
-        retryAttempted: g.retryAttempted,
-        lastFailedCount: g.lastFailedIds.length,
-    })));
+app.get('/debug/persist', async (req, res) => {
+    await persistNow();
+    res.json({ ok: true, redisEnabled: REDIS_ENABLED, channelCount: channelStore.size, groupCount: groups.size });
+});
+
+app.get('/debug/restore', async (req, res) => {
+    const before = channelStore.size;
+    await restoreFromRedis();
+    res.json({ ok: true, before, after: channelStore.size, groupCount: groups.size });
 });
 
 app.get('/debug/token', (req, res) => {
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const day = now.getDate();
-    let active;
-    if (day <= 10) active = 'APIFY_TOKEN1';
-    else if (day <= 20) active = 'APIFY_TOKEN2';
-    else active = 'APIFY_TOKEN3';
+    let active = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
     const token = getApifyToken();
     res.json({
         istDay: day,
@@ -867,29 +1000,24 @@ app.get('/debug/channel/:id', (req, res) => {
     const c = channelStore.get(req.params.id);
     if (!c) return res.status(404).json({ error: 'not found' });
     res.json({
-        channelId: c.channelId,
-        name: c.name,
-        groupId: c.groupId,
-        status: c.status,
-        error: c.error,
+        channelId: c.channelId, name: c.name, groupId: c.groupId,
+        status: c.status, error: c.error,
         expires: c.expires,
         expiresInMinutes: c.expires ? Math.round((c.expires - Date.now() / 1000) / 60) : null,
-        originalUrl: c.originalUrl,
-        currentUrl: c.currentUrl,
-        cookie: c.cookie,
-        refreshing: c.refreshing,
-        lastUpdated: c.lastUpdated,
+        originalUrl: c.originalUrl, currentUrl: c.currentUrl,
+        cookie: c.cookie, refreshing: c.refreshing, lastUpdated: c.lastUpdated,
     });
 });
 
-app.get('/debug/corrupted', (req, res) => {
-    const bad = [];
-    for (const c of channelStore.values()) {
-        if (c.currentUrl && /__hdnea__=__hdnea__=|__hdnea__=hdnea=/.test(c.currentUrl)) {
-            bad.push({ channelId: c.channelId, currentUrl: c.currentUrl, status: c.status });
-        }
-    }
-    res.json({ count: bad.length, channels: bad });
+app.get('/debug/groups', (req, res) => {
+    const now = Math.floor(Date.now() / 1000);
+    res.json([...groups.values()].map(g => ({
+        groupId: g.groupId, channelCount: g.channelIds.length,
+        lastRefreshAt: g.lastRefreshAt, nextRefreshAt: g.nextRefreshAt,
+        secondsUntilRefresh: g.nextRefreshAt ? g.nextRefreshAt - now : null,
+        processing: g.processing, retryAttempted: g.retryAttempted,
+        lastFailedCount: g.lastFailedIds.length,
+    })));
 });
 
 app.get('/debug/state', (req, res) => {
@@ -899,6 +1027,7 @@ app.get('/debug/state', (req, res) => {
         workerMax: MAX_CONCURRENT_RUNS,
         nodeVersion: process.version,
         channelCount: channelStore.size,
+        redisEnabled: REDIS_ENABLED,
         log: eventLog.slice(-200),
     });
 });
@@ -906,7 +1035,7 @@ app.get('/debug/state', (req, res) => {
 // ---------------------------------------------------------------------------
 //  START
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const day = now.getDate();
     const activeToken = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
@@ -915,4 +1044,10 @@ app.listen(PORT, () => {
     log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
     log(`IST day ${day} → using ${activeToken}`);
     log(`Failure threshold: ${FAILURE_THRESHOLD * 100}% → 1 retry after ${GROUP_RETRY_DELAY_MS / 60000} min`);
+    log(`Redis persistence: ${REDIS_ENABLED ? 'ENABLED' : 'DISABLED (set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)'}`);
+
+    if (REDIS_ENABLED) {
+        await restoreFromRedis();
+        setInterval(() => persistNow().catch(() => {}), PERSIST_BACKSTOP_MS);
+    }
 });
