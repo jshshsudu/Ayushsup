@@ -15,15 +15,17 @@ const REDIS_KEY_GROUPS = 'jio:groups';
 const REDIS_KEY_META = 'jio:meta';
 
 async function redisSet(key, value) {
-    if (!REDIS_ENABLED) return;
+    if (!REDIS_ENABLED) return false;
     try {
-        await fetch(`${UPSTASH_URL}/set/${key}`, {
+        const res = await fetch(`${UPSTASH_URL}/set/${key}`, {
             method: 'POST',
             headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
             body: typeof value === 'string' ? value : JSON.stringify(value),
         });
+        return res.ok;
     } catch (e) {
         console.log(`⚠️ Redis set failed: ${e.message}`);
+        return false;
     }
 }
 
@@ -43,7 +45,7 @@ async function redisGet(key) {
 }
 
 // ---------------------------------------------------------------------------
-//  TOKEN ROTATION — reads on every call, IST-based day of month
+//  TOKEN ROTATION
 // ---------------------------------------------------------------------------
 function getApifyToken() {
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
@@ -53,7 +55,7 @@ function getApifyToken() {
     return process.env.APIFY_TOKEN3 || process.env.APIFY_TOKEN;
 }
 
-if (!process.env.APIFY_TOKEN1 && !process.env.APIFY_TOKEN && !process.env.APIFY_TOKEN2 && !process.env.APIFY_TOKEN3) {
+if (!process.env.APIFY_TOKEN1 && !process.env.APIFY_TOKEN) {
     console.error('❌ No APIFY_TOKEN* env variable is set.');
     process.exit(1);
 }
@@ -67,14 +69,14 @@ const BATCH_SIZE = 50;
 const BATCH_MEMORY_MB = 2048;
 const MAX_CONCURRENT_RUNS = 4;
 
-const GROUP_SIZE = 200;
+const GROUP_SIZE = 50;                         // ⬅️ 50 per group now (200 ch = 4 groups)
 const GROUP_STAGGER_MS = 5 * 60 * 1000;
 const GROUP_REFRESH_INTERVAL_S = 5 * 3600;
 const GROUP_RETRY_DELAY_MS = 10 * 60 * 1000;
 const FAILURE_THRESHOLD = 0.05;
 
-const PERSIST_DEBOUNCE_MS = 3000;      // debounce syncs to Redis
-const PERSIST_BACKSTOP_MS = 2 * 60 * 1000;  // periodic backup every 2 min
+const PERSIST_DEBOUNCE_MS = 5000;              // debounce Redis writes 5 s
+const PERSIST_BACKSTOP_MS = 30 * 60 * 1000;    // backstop every 30 min (bandwidth saver)
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
@@ -98,16 +100,26 @@ const eventLog = [];
 function log(msg, level = 'info') {
     const entry = { time: getFormattedDate(), msg, level };
     eventLog.push(entry);
-    if (eventLog.length > 500) eventLog.shift();
+    if (eventLog.length > 200) eventLog.shift();
     const p = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
     console.log(`${p} ${msg}`);
 }
 
 // ---------------------------------------------------------------------------
-//  PERSISTENCE
+//  PERSISTENCE (with dirty-check to save bandwidth)
 // ---------------------------------------------------------------------------
 let persistTimer = null;
 let persistRunning = false;
+let lastPersistedHash = 0;
+
+function simpleHash(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) {
+        h = ((h << 5) - h) + str.charCodeAt(i);
+        h |= 0;
+    }
+    return h;
+}
 
 function schedulePersist() {
     if (!REDIS_ENABLED) return;
@@ -118,26 +130,61 @@ function schedulePersist() {
     }, PERSIST_DEBOUNCE_MS);
 }
 
-async function persistNow() {
+/**
+ * Slim payload: drop currentUrl (rebuildable from originalUrl + cookie),
+ * drop isSpecial (recomputable), drop refreshing/error (transient).
+ */
+function buildPersistPayload() {
+    const slimChannels = [];
+    for (const c of channelStore.values()) {
+        slimChannels.push({
+            i: c.channelId,
+            n: c.name,
+            ou: c.originalUrl,
+            ck: c.cookie,
+            ex: c.expires,
+            lu: c.lastUpdated,
+            st: c.status,
+            gi: c.groupId,
+        });
+    }
+    const slimGroups = [];
+    for (const g of groups.values()) {
+        slimGroups.push({
+            gi: g.groupId,
+            ci: g.channelIds,
+            lr: g.lastRefreshAt,
+            nr: g.nextRefreshAt,
+            ra: g.retryAttempted,
+            lf: g.lastFailedIds,
+        });
+    }
+    return { channels: slimChannels, groups: slimGroups, meta: { stats, savedAt: Math.floor(Date.now() / 1000) } };
+}
+
+async function persistNow(force = false) {
     if (!REDIS_ENABLED || persistRunning) return;
     persistRunning = true;
     try {
-        const channels = [...channelStore.values()];
-        const groupsArr = [...groups.values()].map(g => ({
-            groupId: g.groupId,
-            channelIds: g.channelIds,
-            lastRefreshAt: g.lastRefreshAt,
-            nextRefreshAt: g.nextRefreshAt,
-            retryAttempted: g.retryAttempted,
-            lastFailedIds: g.lastFailedIds,
-        }));
-        const meta = { stats, savedAt: Math.floor(Date.now() / 1000) };
+        const payload = buildPersistPayload();
+        const serialized = JSON.stringify(payload);
+        const hash = simpleHash(serialized);
 
-        await Promise.all([
-            redisSet(REDIS_KEY_CHANNELS, channels),
-            redisSet(REDIS_KEY_GROUPS, groupsArr),
-            redisSet(REDIS_KEY_META, meta),
+        if (!force && hash === lastPersistedHash) {
+            // No state change — skip write (bandwidth saver)
+            return;
+        }
+
+        const ok = await Promise.all([
+            redisSet(REDIS_KEY_CHANNELS, payload.channels),
+            redisSet(REDIS_KEY_GROUPS, payload.groups),
+            redisSet(REDIS_KEY_META, payload.meta),
         ]);
+
+        if (ok.every(Boolean)) {
+            lastPersistedHash = hash;
+            log(`💾 Persisted to Redis (${payload.channels.length} ch, ${payload.groups.length} grp, ${(serialized.length / 1024).toFixed(1)} KB)`);
+        }
     } catch (e) {
         log(`Persist failed: ${e.message}`, 'warn');
     } finally {
@@ -160,7 +207,25 @@ async function restoreFromRedis() {
 
     if (Array.isArray(channels) && channels.length > 0) {
         for (const c of channels) {
-            if (c && c.channelId) channelStore.set(c.channelId, c);
+            if (!c || !c.i) continue;
+            // Rebuild currentUrl from originalUrl + cookie
+            const currentUrl = c.ck && c.ou
+                ? buildUrlWithCookie(c.ou, cleanCookieValue(c.ck))
+                : c.ou;
+
+            channelStore.set(c.i, {
+                channelId: c.i,
+                name: c.n,
+                originalUrl: c.ou,
+                currentUrl,
+                cookie: c.ck,
+                expires: c.ex || 0,
+                lastUpdated: c.lu || '',
+                status: c.st || 'active',
+                groupId: c.gi,
+                isSpecial: isSpecialChannel(c.ou),
+                refreshing: false,
+            });
         }
         log(`✅ Restored ${channelStore.size} channels from Redis`);
     } else {
@@ -169,39 +234,34 @@ async function restoreFromRedis() {
 
     if (Array.isArray(groupsArr) && groupsArr.length > 0) {
         for (const g of groupsArr) {
-            groups.set(g.groupId, {
-                groupId: g.groupId,
-                channelIds: g.channelIds || [],
-                lastRefreshAt: g.lastRefreshAt,
-                nextRefreshAt: g.nextRefreshAt,
+            if (!g || !g.gi) continue;
+            groups.set(g.gi, {
+                groupId: g.gi,
+                channelIds: g.ci || [],
+                lastRefreshAt: g.lr,
+                nextRefreshAt: g.nr,
                 timer: null,
                 processing: false,
-                retryAttempted: !!g.retryAttempted,
-                lastFailedIds: g.lastFailedIds || [],
+                retryAttempted: !!g.ra,
+                lastFailedIds: g.lf || [],
             });
         }
         log(`✅ Restored ${groups.size} groups`);
 
-        // Re-schedule each group's refresh based on its saved nextRefreshAt
         const now = Math.floor(Date.now() / 1000);
         for (const g of groups.values()) {
             let delayMs;
             if (g.nextRefreshAt && g.nextRefreshAt > now) {
                 delayMs = (g.nextRefreshAt - now) * 1000;
             } else {
-                // Missed — schedule 30 s out to avoid stampede
-                delayMs = 30 * 1000;
+                delayMs = 30 * 1000;   // missed — catch up in 30 s
             }
             scheduleGroupRefresh(g.groupId, delayMs);
             log(`  ↻ [${g.groupId}] rescheduled in ${Math.round(delayMs / 1000)} s`);
         }
-    } else {
-        log('ℹ️ No groups in Redis');
     }
 
-    if (meta && meta.stats) {
-        Object.assign(stats, meta.stats);
-    }
+    if (meta && meta.stats) Object.assign(stats, meta.stats);
 }
 
 // ---------------------------------------------------------------------------
@@ -440,8 +500,7 @@ async function processBatchOfChannels(channels, label) {
             const stillValid = current.expires && current.expires > now + 60;
             channelStore.set(ch.channelId, {
                 ...current,
-                channelId: ch.channelId,
-                name: ch.name,
+                channelId: ch.channelId, name: ch.name,
                 originalUrl: current.originalUrl || ch.url,
                 currentUrl: current.currentUrl || sanitizeUrl(ch.url),
                 cookie: current.cookie || '',
@@ -455,11 +514,7 @@ async function processBatchOfChannels(channels, label) {
         }
 
         aclToCookie.delete(aclUrl);
-        if (hit.exp <= 0) {
-            failed++;
-            failedIds.push(ch.channelId);
-            continue;
-        }
+        if (hit.exp <= 0) { failed++; failedIds.push(ch.channelId); continue; }
 
         const newUrl = buildUrlWithCookie(current.originalUrl || ch.url, hit.cookieValue);
 
@@ -553,10 +608,6 @@ async function processGroup(groupId) {
             return { channelId: c.channelId, name: c.name, url: chosen };
         });
 
-        if (inputs[0]) {
-            log(`   [${groupId}] sample url: ${inputs[0].url.slice(0, 120)}…`);
-        }
-
         const batches = chunkArray(inputs, BATCH_SIZE);
         let idx = 0;
         let totalMatched = 0;
@@ -598,7 +649,7 @@ async function processGroup(groupId) {
         g.lastRefreshAt = Math.floor(Date.now() / 1000);
 
         if (failRatio > FAILURE_THRESHOLD && !g.retryAttempted) {
-            log(`⚠️ [${groupId}] ${(failRatio * 100).toFixed(1)}% > ${(FAILURE_THRESHOLD * 100)}% threshold — retrying ${allFailedIds.length} channels in ${GROUP_RETRY_DELAY_MS / 60000} min (1 retry only)`);
+            log(`⚠️ [${groupId}] ${(failRatio * 100).toFixed(1)}% > ${(FAILURE_THRESHOLD * 100)}% — retrying ${allFailedIds.length} channels in ${GROUP_RETRY_DELAY_MS / 60000} min`);
             g.retryAttempted = true;
             g.lastFailedIds = allFailedIds;
             g.processing = false;
@@ -744,17 +795,17 @@ body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;paddi
 h1{font-size:1.5rem;margin-bottom:16px;color:#38bdf8}
 h2{font-size:1.1rem;margin:16px 0 8px;color:#94a3b8}
 .card{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px}
 .stat{background:#0f172a;border-radius:8px;padding:12px}
 .stat-label{font-size:.7rem;color:#64748b;text-transform:uppercase}
 .stat-value{font-size:1.3rem;font-weight:700;color:#38bdf8;margin-top:4px}
 .green{color:#4ade80!important}.red{color:#f87171!important}.yellow{color:#facc15!important}
-textarea{width:100%;min-height:200px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:monospace;font-size:12px}
+textarea{width:100%;min-height:180px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:12px;font-family:monospace;font-size:12px}
 button{background:#38bdf8;color:#0f172a;border:none;padding:10px 20px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px;margin-right:8px;margin-top:8px}
 button:disabled{opacity:.5}
 button.secondary{background:#334155;color:#e2e8f0}
 button.danger{background:#7f1d1d;color:#fecaca}
-.log{background:#0f172a;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:400px;overflow-y:auto;white-space:pre-wrap;line-height:1.5}
+.log{background:#0f172a;border-radius:8px;padding:12px;font-family:monospace;font-size:12px;max-height:350px;overflow-y:auto;white-space:pre-wrap;line-height:1.4}
 .log .err{color:#f87171}.log .warn{color:#facc15}
 a{text-decoration:none}
 table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
@@ -768,7 +819,6 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <button class="secondary" onclick="refreshAll()">🔄 Refresh All Groups</button>
 <button class="danger" onclick="clearAll()">🗑 Clear All</button>
 <a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
-<a href="/debug/state" target="_blank"><button class="secondary">🔍 Debug</button></a>
 </div>
 <div class="card"><h2>Status</h2>
 <div class="grid">
@@ -777,21 +827,21 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <div class="stat"><div class="stat-label">Failed</div><div class="stat-value red" id="s-failed">0</div></div>
 <div class="stat"><div class="stat-label">Groups</div><div class="stat-value" id="s-groups">0</div></div>
 <div class="stat"><div class="stat-label">Refreshes</div><div class="stat-value" id="s-refreshes">0</div></div>
-<div class="stat"><div class="stat-label">Retries</div><div class="stat-value yellow" id="s-retries">0</div></div>
 <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="s-workers">0/4</div></div>
 <div class="stat"><div class="stat-label">Redis</div><div class="stat-value" id="s-redis">—</div></div>
 </div>
 </div>
 <div class="card"><h2>Groups</h2>
-<table><thead><tr><th>Group</th><th>Channels</th><th>Last Refresh</th><th>Next Refresh</th><th>Retry</th><th>Status</th></tr></thead>
+<table><thead><tr><th>Group</th><th>Ch</th><th>Last</th><th>Next</th><th>Retry</th><th>Status</th></tr></thead>
 <tbody id="groups"></tbody></table>
 </div>
 <div class="card"><h2>Channels</h2>
-<table><thead><tr><th>ID</th><th>Name</th><th>Group</th><th>Status</th><th>Expires In</th><th>Updated</th></tr></thead>
+<table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Expires In</th></tr></thead>
 <tbody id="channels"></tbody></table>
 </div>
 <div class="card"><h2>Event Log</h2><div class="log" id="log">Waiting…</div></div>
 <script>
+let pollTimer=null;
 async function loadStatus(){
 try{
 const r=await fetch('/ayush8481/status');
@@ -801,10 +851,10 @@ document.getElementById('s-active').textContent=d.stats.active;
 document.getElementById('s-failed').textContent=d.stats.failed;
 document.getElementById('s-groups').textContent=d.stats.groupCount;
 document.getElementById('s-refreshes').textContent=d.stats.refreshCount;
-document.getElementById('s-retries').textContent=d.stats.retryCount;
 document.getElementById('s-workers').textContent=d.workerActive+'/'+d.workerMax;
-document.getElementById('s-redis').textContent=d.redisEnabled?(d.redisOk?'yes':'err'):'off';
-document.getElementById('s-redis').className='stat-value '+(d.redisEnabled?(d.redisOk?'green':'red'):'yellow');
+const rd=document.getElementById('s-redis');
+rd.textContent=d.redisEnabled?'on':'off';
+rd.className='stat-value '+(d.redisEnabled?'green':'yellow');
 
 const gt=document.getElementById('groups');
 gt.innerHTML='';
@@ -812,24 +862,29 @@ for(const g of d.groups){
 const tr=document.createElement('tr');
 const next=g.nextRefreshAt?new Date(g.nextRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
 const last=g.lastRefreshAt?new Date(g.lastRefreshAt*1000).toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata'}):'—';
-tr.innerHTML='<td style="font-size:10px">'+g.groupId+'</td><td>'+g.channelIds.length+'</td><td>'+last+'</td><td>'+next+'</td><td>'+(g.retryAttempted?'<span class="yellow">YES</span>':'no')+'</td><td>'+(g.processing?'<span class="yellow">processing</span>':'idle')+'</td>';
+tr.innerHTML='<td style="font-size:10px">'+g.groupId.slice(0,12)+'…</td><td>'+g.channelCount+'</td><td>'+last+'</td><td>'+next+'</td><td>'+(g.retryAttempted?'Y':'n')+'</td><td>'+(g.processing?'<span class="yellow">proc</span>':'idle')+'</td>';
 gt.appendChild(tr);
 }
 
 const tbody=document.getElementById('channels');
 tbody.innerHTML='';
-for(const c of d.channels.slice(0,300)){
+for(const c of d.channelSummary){
 const tr=document.createElement('tr');
-const expTxt=c.expires?Math.max(0,Math.round((c.expires-Date.now()/1000)/60))+' min':'—';
+const expTxt=c.expiresIn!=null?Math.max(0,c.expiresIn)+' min':'—';
 let cls=c.status==='active'?'green':(c.status==='error'||c.status==='failed'||c.status==='no_cookie')?'red':'yellow';
-tr.innerHTML='<td>'+c.channelId+'</td><td>'+(c.name||'')+'</td><td style="font-size:10px">'+(c.groupId||'')+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td><td>'+(c.lastUpdated||'')+'</td>';
+tr.innerHTML='<td>'+c.id+'</td><td>'+(c.name||'')+'</td><td class="'+cls+'">'+c.status+'</td><td>'+expTxt+'</td>';
 tbody.appendChild(tr);
 }
 const logEl=document.getElementById('log');
-logEl.innerHTML=d.log.slice(-80).map(e=>'<div class="'+(e.level==='error'?'err':e.level==='warn'?'warn':'')+'">'+e.time+'  '+e.msg+'</div>').join('');
+logEl.innerHTML=d.log.slice(-40).map(e=>'<div class="'+(e.level==='error'?'err':e.level==='warn'?'warn':'')+'">'+e.time+'  '+e.msg+'</div>').join('');
 logEl.scrollTop=logEl.scrollHeight;
 }catch(e){}
 }
+function startPoll(){if(pollTimer)clearInterval(pollTimer);pollTimer=setInterval(loadStatus,30000);}
+document.addEventListener('visibilitychange',()=>{
+if(document.hidden){if(pollTimer)clearInterval(pollTimer);pollTimer=null;}
+else{loadStatus();startPoll();}
+});
 async function processInput(){
 const btn=document.getElementById('processBtn');
 const text=document.getElementById('input').value.trim();
@@ -857,7 +912,7 @@ if(!confirm('Clear ALL state (including Redis)?'))return;
 await fetch('/ayush8481/clear',{method:'POST'});
 loadStatus();
 }
-loadStatus();setInterval(loadStatus,5000);
+loadStatus();startPoll();
 </script></body></html>`);
 });
 
@@ -898,26 +953,38 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), async (req, res) => 
     }
 });
 
+// ---------------------------------------------------------------------------
+//  STATUS — compact response (no URLs) to save bandwidth
+// ---------------------------------------------------------------------------
 app.get('/ayush8481/status', (req, res) => {
     const all = [...channelStore.values()];
     const active = all.filter(c => c.status === 'active').length;
+    const now = Math.floor(Date.now() / 1000);
+
     const groupArr = [...groups.values()].map(g => ({
         groupId: g.groupId,
-        channelIds: g.channelIds,
+        channelCount: g.channelIds.length,
         lastRefreshAt: g.lastRefreshAt,
         nextRefreshAt: g.nextRefreshAt,
         processing: g.processing,
         retryAttempted: g.retryAttempted,
     }));
+
+    const channelSummary = all.map(c => ({
+        id: c.channelId,
+        name: c.name,
+        status: c.status,
+        expiresIn: c.expires ? Math.round((c.expires - now) / 60) : null,
+    }));
+
     res.json({
         stats: { ...stats, active, groupCount: groups.size },
         workerActive: apifyLimit.activeCount,
         workerMax: MAX_CONCURRENT_RUNS,
         groups: groupArr,
-        channels: all,
-        log: eventLog.slice(-100),
+        channelSummary,
+        log: eventLog.slice(-40),
         redisEnabled: REDIS_ENABLED,
-        redisOk: REDIS_ENABLED,
     });
 });
 
@@ -944,6 +1011,7 @@ app.post('/ayush8481/clear', async (req, res) => {
     stats.failed = 0;
     stats.refreshCount = 0;
     stats.retryCount = 0;
+    lastPersistedHash = 0;
     if (REDIS_ENABLED) {
         await Promise.all([
             redisSet(REDIS_KEY_CHANNELS, []),
@@ -955,6 +1023,9 @@ app.post('/ayush8481/clear', async (req, res) => {
     res.json({ ok: true });
 });
 
+// ---------------------------------------------------------------------------
+//  /jiostb.json with ETag → 304 for unchanged content (bandwidth saver)
+// ---------------------------------------------------------------------------
 app.get('/jiostb.json', (req, res) => {
     const result = [...channelStore.values()]
         .filter(c => c.currentUrl && c.currentUrl.includes('__hdnea__=') && c.expires > 0)
@@ -963,16 +1034,26 @@ app.get('/jiostb.json', (req, res) => {
             url: sanitizeUrl(c.currentUrl),
             name: c.name,
             last_updated: c.lastUpdated,
-            expires: c.expires,
         }));
-    res.json(result);
+
+    const body = JSON.stringify(result);
+    const etag = `W/"${simpleHash(body).toString(16)}"`;
+
+    if (req.headers['if-none-match'] === etag) {
+        return res.status(304).end();
+    }
+
+    res.set('ETag', etag);
+    res.set('Cache-Control', 'public, max-age=120');
+    res.type('application/json').send(body);
 });
 
 // ---------------------------------------------------------------------------
 //  DIAGNOSTICS
 // ---------------------------------------------------------------------------
 app.get('/debug/persist', async (req, res) => {
-    await persistNow();
+    lastPersistedHash = 0;   // force write
+    await persistNow(true);
     res.json({ ok: true, redisEnabled: REDIS_ENABLED, channelCount: channelStore.size, groupCount: groups.size });
 });
 
@@ -985,14 +1066,12 @@ app.get('/debug/restore', async (req, res) => {
 app.get('/debug/token', (req, res) => {
     const now = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     const day = now.getDate();
-    let active = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
+    const active = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
     const token = getApifyToken();
     res.json({
         istDay: day,
-        istDate: now.toISOString().slice(0, 10),
         activeToken: active,
         tokenPrefix: token ? token.slice(0, 14) + '…' : '(missing)',
-        fallbackUsed: !process.env[active],
     });
 });
 
@@ -1028,7 +1107,7 @@ app.get('/debug/state', (req, res) => {
         nodeVersion: process.version,
         channelCount: channelStore.size,
         redisEnabled: REDIS_ENABLED,
-        log: eventLog.slice(-200),
+        log: eventLog.slice(-100),
     });
 });
 
@@ -1041,10 +1120,9 @@ app.listen(PORT, async () => {
     const activeToken = day <= 10 ? 'APIFY_TOKEN1' : day <= 20 ? 'APIFY_TOKEN2' : 'APIFY_TOKEN3';
     log(`Server started on port ${PORT}`);
     log(`Batch: ${BATCH_SIZE} @ ${BATCH_MEMORY_MB} MB | Workers: ${MAX_CONCURRENT_RUNS}`);
-    log(`Group size: ${GROUP_SIZE} | Stagger: ${GROUP_STAGGER_MS / 60000} min | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
-    log(`IST day ${day} → using ${activeToken}`);
-    log(`Failure threshold: ${FAILURE_THRESHOLD * 100}% → 1 retry after ${GROUP_RETRY_DELAY_MS / 60000} min`);
-    log(`Redis persistence: ${REDIS_ENABLED ? 'ENABLED' : 'DISABLED (set UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN)'}`);
+    log(`Group size: ${GROUP_SIZE} | Refresh interval: ${GROUP_REFRESH_INTERVAL_S / 3600} h`);
+    log(`IST day ${day} → ${activeToken}`);
+    log(`Redis: ${REDIS_ENABLED ? 'ENABLED' : 'DISABLED'}`);
 
     if (REDIS_ENABLED) {
         await restoreFromRedis();
