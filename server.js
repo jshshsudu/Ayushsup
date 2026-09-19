@@ -13,6 +13,7 @@ const REDIS_ENABLED = !!(UPSTASH_URL && UPSTASH_TOKEN);
 const REDIS_KEY_CHANNELS = 'jio:channels';
 const REDIS_KEY_GROUPS = 'jio:groups';
 const REDIS_KEY_META = 'jio:meta';
+const SCHEMA_VERSION = 2;
 
 async function redisSet(key, value) {
     if (!REDIS_ENABLED) return false;
@@ -69,14 +70,14 @@ const BATCH_SIZE = 50;
 const BATCH_MEMORY_MB = 2048;
 const MAX_CONCURRENT_RUNS = 4;
 
-const GROUP_SIZE = 50;                         // ⬅️ 50 per group now (200 ch = 4 groups)
+const GROUP_SIZE = 50;
 const GROUP_STAGGER_MS = 5 * 60 * 1000;
 const GROUP_REFRESH_INTERVAL_S = 5 * 3600;
 const GROUP_RETRY_DELAY_MS = 10 * 60 * 1000;
 const FAILURE_THRESHOLD = 0.05;
 
-const PERSIST_DEBOUNCE_MS = 5000;              // debounce Redis writes 5 s
-const PERSIST_BACKSTOP_MS = 30 * 60 * 1000;    // backstop every 30 min (bandwidth saver)
+const PERSIST_DEBOUNCE_MS = 5000;
+const PERSIST_BACKSTOP_MS = 30 * 60 * 1000;
 
 const apifyLimit = pLimit(MAX_CONCURRENT_RUNS);
 
@@ -106,7 +107,7 @@ function log(msg, level = 'info') {
 }
 
 // ---------------------------------------------------------------------------
-//  PERSISTENCE (with dirty-check to save bandwidth)
+//  PERSISTENCE
 // ---------------------------------------------------------------------------
 let persistTimer = null;
 let persistRunning = false;
@@ -130,10 +131,6 @@ function schedulePersist() {
     }, PERSIST_DEBOUNCE_MS);
 }
 
-/**
- * Slim payload: drop currentUrl (rebuildable from originalUrl + cookie),
- * drop isSpecial (recomputable), drop refreshing/error (transient).
- */
 function buildPersistPayload() {
     const slimChannels = [];
     for (const c of channelStore.values()) {
@@ -159,7 +156,11 @@ function buildPersistPayload() {
             lf: g.lastFailedIds,
         });
     }
-    return { channels: slimChannels, groups: slimGroups, meta: { stats, savedAt: Math.floor(Date.now() / 1000) } };
+    return {
+        channels: slimChannels,
+        groups: slimGroups,
+        meta: { version: SCHEMA_VERSION, stats, savedAt: Math.floor(Date.now() / 1000) },
+    };
 }
 
 async function persistNow(force = false) {
@@ -171,7 +172,6 @@ async function persistNow(force = false) {
         const hash = simpleHash(serialized);
 
         if (!force && hash === lastPersistedHash) {
-            // No state change — skip write (bandwidth saver)
             return;
         }
 
@@ -192,6 +192,58 @@ async function persistNow(force = false) {
     }
 }
 
+// ---------------------------------------------------------------------------
+//  RESTORE (schema-agnostic: accepts both old and new formats)
+// ---------------------------------------------------------------------------
+function normalizeChannel(c) {
+    if (!c) return null;
+    const channelId = c.i ?? c.channelId;
+    const originalUrl = c.ou ?? c.originalUrl;
+    if (!channelId || !originalUrl) return null;
+
+    const cookie = c.ck ?? c.cookie ?? '';
+    const expires = c.ex ?? c.expires ?? 0;
+
+    let currentUrl = c.currentUrl;
+    if (!currentUrl) {
+        currentUrl = cookie
+            ? buildUrlWithCookie(originalUrl, cleanCookieValue(cookie))
+            : originalUrl;
+    } else {
+        currentUrl = sanitizeUrl(currentUrl);
+    }
+
+    return {
+        channelId: String(channelId),
+        name: c.n ?? c.name ?? String(channelId),
+        originalUrl,
+        currentUrl,
+        cookie,
+        expires,
+        lastUpdated: c.lu ?? c.lastUpdated ?? '',
+        status: c.st ?? c.status ?? 'active',
+        groupId: c.gi ?? c.groupId,
+        isSpecial: isSpecialChannel(originalUrl),
+        refreshing: false,
+    };
+}
+
+function normalizeGroup(g) {
+    if (!g) return null;
+    const groupId = g.gi ?? g.groupId;
+    if (!groupId) return null;
+    return {
+        groupId,
+        channelIds: g.ci ?? g.channelIds ?? [],
+        lastRefreshAt: g.lr ?? g.lastRefreshAt ?? null,
+        nextRefreshAt: g.nr ?? g.nextRefreshAt ?? null,
+        timer: null,
+        processing: false,
+        retryAttempted: !!(g.ra ?? g.retryAttempted),
+        lastFailedIds: g.lf ?? g.lastFailedIds ?? [],
+    };
+}
+
 async function restoreFromRedis() {
     if (!REDIS_ENABLED) {
         log('ℹ️ Redis not configured — persistence disabled');
@@ -205,48 +257,38 @@ async function restoreFromRedis() {
         redisGet(REDIS_KEY_META),
     ]);
 
-    if (Array.isArray(channels) && channels.length > 0) {
-        for (const c of channels) {
-            if (!c || !c.i) continue;
-            // Rebuild currentUrl from originalUrl + cookie
-            const currentUrl = c.ck && c.ou
-                ? buildUrlWithCookie(c.ou, cleanCookieValue(c.ck))
-                : c.ou;
+    if (meta && meta.version && meta.version !== SCHEMA_VERSION) {
+        log(`ℹ️ Detected schema version ${meta.version} (current ${SCHEMA_VERSION}) — will migrate on next persist`);
+    }
 
-            channelStore.set(c.i, {
-                channelId: c.i,
-                name: c.n,
-                originalUrl: c.ou,
-                currentUrl,
-                cookie: c.ck,
-                expires: c.ex || 0,
-                lastUpdated: c.lu || '',
-                status: c.st || 'active',
-                groupId: c.gi,
-                isSpecial: isSpecialChannel(c.ou),
-                refreshing: false,
-            });
+    if (Array.isArray(channels) && channels.length > 0) {
+        let restored = 0, skipped = 0;
+        for (const c of channels) {
+            const n = normalizeChannel(c);
+            if (n) {
+                channelStore.set(n.channelId, n);
+                restored++;
+            } else {
+                skipped++;
+            }
         }
-        log(`✅ Restored ${channelStore.size} channels from Redis`);
+        log(`✅ Restored ${restored} channels (${skipped} skipped of ${channels.length})`);
     } else {
         log('ℹ️ No channels in Redis');
     }
 
     if (Array.isArray(groupsArr) && groupsArr.length > 0) {
+        let restored = 0, skipped = 0;
         for (const g of groupsArr) {
-            if (!g || !g.gi) continue;
-            groups.set(g.gi, {
-                groupId: g.gi,
-                channelIds: g.ci || [],
-                lastRefreshAt: g.lr,
-                nextRefreshAt: g.nr,
-                timer: null,
-                processing: false,
-                retryAttempted: !!g.ra,
-                lastFailedIds: g.lf || [],
-            });
+            const n = normalizeGroup(g);
+            if (n) {
+                groups.set(n.groupId, n);
+                restored++;
+            } else {
+                skipped++;
+            }
         }
-        log(`✅ Restored ${groups.size} groups`);
+        log(`✅ Restored ${restored} groups (${skipped} skipped of ${groupsArr.length})`);
 
         const now = Math.floor(Date.now() / 1000);
         for (const g of groups.values()) {
@@ -254,14 +296,26 @@ async function restoreFromRedis() {
             if (g.nextRefreshAt && g.nextRefreshAt > now) {
                 delayMs = (g.nextRefreshAt - now) * 1000;
             } else {
-                delayMs = 30 * 1000;   // missed — catch up in 30 s
+                delayMs = 30 * 1000;
             }
             scheduleGroupRefresh(g.groupId, delayMs);
             log(`  ↻ [${g.groupId}] rescheduled in ${Math.round(delayMs / 1000)} s`);
         }
+    } else {
+        log('ℹ️ No groups in Redis');
     }
 
     if (meta && meta.stats) Object.assign(stats, meta.stats);
+
+    const all = [...channelStore.values()];
+    const active = all.filter(c => c.status === 'active').length;
+    log(`📊 After restore: ${all.length} channels total, ${active} active`);
+
+    // Immediately persist back in the new schema so future restores are clean
+    if (channelStore.size > 0) {
+        lastPersistedHash = 0;
+        persistNow(true).catch(() => {});
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -819,6 +873,7 @@ th{color:#64748b;font-weight:600;text-transform:uppercase;font-size:.7rem}
 <button class="secondary" onclick="refreshAll()">🔄 Refresh All Groups</button>
 <button class="danger" onclick="clearAll()">🗑 Clear All</button>
 <a href="/jiostb.json" target="_blank"><button class="secondary">📥 jiostb.json</button></a>
+<a href="/debug/state" target="_blank"><button class="secondary">🔍 Debug</button></a>
 </div>
 <div class="card"><h2>Status</h2>
 <div class="grid">
@@ -953,9 +1008,6 @@ app.post('/ayush8481/add', express.json({ limit: '10mb' }), async (req, res) => 
     }
 });
 
-// ---------------------------------------------------------------------------
-//  STATUS — compact response (no URLs) to save bandwidth
-// ---------------------------------------------------------------------------
 app.get('/ayush8481/status', (req, res) => {
     const all = [...channelStore.values()];
     const active = all.filter(c => c.status === 'active').length;
@@ -1016,16 +1068,13 @@ app.post('/ayush8481/clear', async (req, res) => {
         await Promise.all([
             redisSet(REDIS_KEY_CHANNELS, []),
             redisSet(REDIS_KEY_GROUPS, []),
-            redisSet(REDIS_KEY_META, { stats, savedAt: Math.floor(Date.now() / 1000) }),
+            redisSet(REDIS_KEY_META, { version: SCHEMA_VERSION, stats, savedAt: Math.floor(Date.now() / 1000) }),
         ]);
     }
     log('Store cleared (including Redis).');
     res.json({ ok: true });
 });
 
-// ---------------------------------------------------------------------------
-//  /jiostb.json with ETag → 304 for unchanged content (bandwidth saver)
-// ---------------------------------------------------------------------------
 app.get('/jiostb.json', (req, res) => {
     const result = [...channelStore.values()]
         .filter(c => c.currentUrl && c.currentUrl.includes('__hdnea__=') && c.expires > 0)
@@ -1052,7 +1101,7 @@ app.get('/jiostb.json', (req, res) => {
 //  DIAGNOSTICS
 // ---------------------------------------------------------------------------
 app.get('/debug/persist', async (req, res) => {
-    lastPersistedHash = 0;   // force write
+    lastPersistedHash = 0;
     await persistNow(true);
     res.json({ ok: true, redisEnabled: REDIS_ENABLED, channelCount: channelStore.size, groupCount: groups.size });
 });
